@@ -18,15 +18,28 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Setup Android SDK
+      - name: Setup Android SDK Environment
         uses: android-actions/setup-android@v3
+        continue-on-error: true
+
+      - name: Manual SDK & NDK Environment Fallback
+        run: |
+          if [ -z "$ANDROID_HOME" ]; then
+            echo "ANDROID_HOME=$HOME/Android/Sdk" >> $GITHUB_ENV
+            export ANDROID_HOME=$HOME/Android/Sdk
+          fi
+          mkdir -p "$ANDROID_HOME/cmdline-tools/latest"
+          wget -q https://google.com -O cmdline.zip
+          unzip -q cmdline.zip -d /tmp
+          mv /tmp/cmdline-tools/* "$ANDROID_HOME/cmdline-tools/latest/"
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> $GITHUB_PATH
 
       - name: Install SDK Components & NDK
         run: |
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
           sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;26.1.10909125"
 
-      - name: Set up Gradle
+      - name: Set up Gradle Engine
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
@@ -237,25 +250,23 @@ jobs:
           EOF
 
           cat > app/src/main/java/ai/venice/vnx/antiflag/ReportCleaner.kt <<'EOF'
-          package ai.venice.vnx.antiflag
-          object ReportCleaner {
-              fun run(): List<String> = listOf("clean")
-          }
-          EOF
-
-          cat > app/src/main/java/ai/venice/vnx/overlay/OverlaySvc.kt <<'EOF'
-          package ai.venice.vnx.overlay
-          import android.app.Service
-          import android.content.Intent
-          import android.os.IBinder
-          class OverlaySvc : Service() {
-              override fun onBind(i: Intent?): IBinder? = null
-          }
-          EOF
-
-          cat > app/src/main/java/ai/venice/vnx/MainActivity.kt <<'EOF'
-          package ai.venice.vnx
 Use code with caution.
+package ai.venice.vnx.antiflag
+object ReportCleaner {
+fun run(): List = listOf("clean")
+}
+EOF
+cat > app/src/main/java/ai/venice/vnx/overlay/OverlaySvc.kt <<'EOF'
+package ai.venice.vnx.overlay
+import android.app.Service
+import android.content.Intent
+import android.os.IBinder
+class OverlaySvc : Service() {
+override fun onBind(i: Intent?): IBinder? = null
+}
+EOF
+cat > app/src/main/java/ai/venice/vnx/MainActivity.kt <<'EOF'
+package ai.venice.vnx
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
