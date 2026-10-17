@@ -1,107 +1,163 @@
 name: build-apk
+
 on:
   push:
+    branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NDK_VERSION: 26.1.10909125
+  GRADLE_VERSION: 8.10.2
+  APK_NAME: VNX-Apex.apk
+
 jobs:
-  build:
+  apk:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
+    timeout-minutes: 50
     steps:
-      - uses: actions/checkout@v4
+      - name: checkout
+        uses: actions/checkout@v4
 
-      - name: Set up JDK 17
+      - name: jdk17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install SDK, build-tools, NDK
+      - name: toolchain
         run: |
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;26.1.10909125"
+          set -euxo pipefail
+          SDK="$HOME/android-sdk"
+          mkdir -p "$SDK/cmdline-tools"
+          curl -sSL -o /tmp/ct.zip "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+          unzip -q -o /tmp/ct.zip -d /tmp/ct
+          rm -rf "$SDK/cmdline-tools/latest"
+          mv /tmp/ct/cmdline-tools "$SDK/cmdline-tools/latest"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "$SDK/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
+          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+          "$SDK/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;${NDK_VERSION}"
+          curl -sSL -o /tmp/g.zip "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
+          unzip -q -o /tmp/g.zip -d "$HOME"
+          echo "$HOME/gradle-${GRADLE_VERSION}/bin" >> "$GITHUB_PATH"
+          test -x "$HOME/gradle-${GRADLE_VERSION}/bin/gradle"
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.10.2'
-
-      - name: Scaffold project
+      - name: keystore
         run: |
-          mkdir -p app/src/main/java/ai/venice/vnx/core
-          mkdir -p app/src/main/java/ai/venice/vnx/native
-          mkdir -p app/src/main/java/ai/venice/vnx/re
-          mkdir -p app/src/main/java/ai/venice/vnx/read
-          mkdir -p app/src/main/java/ai/venice/vnx/overlay
-          mkdir -p app/src/main/java/ai/venice/vnx/antiflag
-          mkdir -p app/src/main/cpp app/src/main/assets app/src/main/res/values
+          set -euxo pipefail
+          mkdir -p ~/.android
+          [ -f ~/.android/debug.keystore ] || keytool -genkeypair -v \
+            -keystore ~/.android/debug.keystore -storepass android \
+            -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 \
+            -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+
+      - name: write-sources
+        run: |
+          set -euo pipefail
+          mkdir -p app/src/main/java/ai/venice/vnx app/src/main/cpp \
+                   app/src/main/res/drawable app/src/main/res/values \
+                   app/src/main/res/mipmap-anydpi app/src/main/res/mipmap-anydpi-v26 \
+                   app/src/main/assets out
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
 
           cat > settings.gradle.kts <<'EOF'
-          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
-          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
           rootProject.name = "VNX"
           include(":app")
           EOF
 
           cat > build.gradle.kts <<'EOF'
           plugins {
-              id("com.android.application") version "8.7.0" apply false
+              id("com.android.application") version "8.7.3" apply false
               id("org.jetbrains.kotlin.android") version "2.0.21" apply false
               id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
           }
           EOF
 
           cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g
+          org.gradle.parallel=true
+          org.gradle.caching=true
           android.useAndroidX=true
           android.nonTransitiveRClass=true
-          org.gradle.jvmargs=-Xmx3072m
+          kotlin.code.style=official
           EOF
 
-          cat > local.properties <<'EOF'
+          cat > app/proguard-rules.pro <<'EOF'
+          -keep class rikka.shizuku.** { *; }
+          -keep class moe.shizuku.** { *; }
+          -dontwarn rikka.shizuku.**
+          -dontwarn moe.shizuku.**
           EOF
-          echo "sdk.dir=$ANDROID_HOME" > local.properties
 
           cat > app/build.gradle.kts <<'EOF'
+          import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
           plugins {
               id("com.android.application")
               id("org.jetbrains.kotlin.android")
               id("org.jetbrains.kotlin.plugin.compose")
           }
+
           android {
               namespace = "ai.venice.vnx"
               compileSdk = 35
+
               defaultConfig {
                   applicationId = "ai.venice.vnx"
                   minSdk = 26
                   targetSdk = 35
-                  versionCode = 1
-                  versionName = "1.0"
-                  ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
+                  versionCode = 9
+                  versionName = "1.8"
               }
-              externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt") } }
-              buildFeatures { compose = true }
+
+              buildTypes {
+                  getByName("debug") { isMinifyEnabled = false }
+                  getByName("release") {
+                      isMinifyEnabled = false
+                      proguardFiles(
+                          getDefaultProguardFile("proguard-android-optimize.txt"),
+                          "proguard-rules.pro"
+                      )
+                      signingConfig = signingConfigs.getByName("debug")
+                  }
+              }
+
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
                   targetCompatibility = JavaVersion.VERSION_17
               }
-              kotlinOptions { jvmTarget = "17" }
-              buildTypes {
-                  release {
-                      isMinifyEnabled = false
-                      signingConfig = signingConfigs.getByName("debug")
-                  }
+              buildFeatures { compose = true }
+              lint {
+                  checkReleaseBuilds = false
+                  abortOnError = false
               }
           }
+
+          kotlin { compilerOptions { jvmTarget.set(JvmTarget.JVM_17) } }
+
           dependencies {
-              implementation("androidx.core:core-ktx:1.13.1")
-              implementation("androidx.activity:activity-compose:1.9.3")
               implementation(platform("androidx.compose:compose-bom:2024.10.01"))
               implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.foundation:foundation")
               implementation("androidx.compose.material3:material3")
+              implementation("androidx.activity:activity-compose:1.9.3")
+              implementation("androidx.core:core-ktx:1.13.1")
               implementation("dev.rikka.shizuku:api:13.1.5")
               implementation("dev.rikka.shizuku:provider:13.1.5")
           }
@@ -110,521 +166,1620 @@ jobs:
           cat > app/src/main/AndroidManifest.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
               <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="moe.shizuku.manager.permission.API_V23"/>
+
               <queries>
                   <package android:name="moe.shizuku.privileged.api"/>
                   <package android:name="com.dts.freefireth"/>
                   <package android:name="com.dts.freefiremax"/>
               </queries>
-              <application android:label="@string/app_name" android:theme="@style/Theme.VNX">
-                  <activity android:name=".MainActivity" android:exported="true">
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher"
+                  android:label="VNX Apex"
+                  android:hardwareAccelerated="true"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTop"
+                      android:configChanges="orientation|screenSize|keyboardHidden|uiMode">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN"/>
                           <category android:name="android.intent.category.LAUNCHER"/>
                       </intent-filter>
                   </activity>
-                  <service android:name=".overlay.OverlaySvc"
+
+                  <service
+                      android:name=".OverlaySvc"
                       android:exported="false"
                       android:foregroundServiceType="specialUse">
-                      <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                                android:value="game overlay panel"/>
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="game overlay and memory helper"/>
                   </service>
-                  <provider android:name="rikka.shizuku.ShizukuProvider"
+
+                  <provider
+                      android:name="rikka.shizuku.ShizukuProvider"
                       android:authorities="${applicationId}.shizuku"
-                      android:multiprocess="false"
                       android:enabled="true"
                       android:exported="true"
+                      android:multiprocess="false"
                       android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"/>
               </application>
           </manifest>
           EOF
 
-          cat > app/src/main/res/values/strings.xml <<'EOF'
-          <resources><string name="app_name">VNX Apex</string></resources>
-          EOF
-
-          cat > app/src/main/res/values/themes.xml <<'EOF'
+          cat > app/src/main/res/values/colors.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
           <resources>
-              <style name="Theme.VNX" parent="android:Theme.Material.NoActionBar">
-                  <item name="android:windowBackground">#060709</item>
-                  <item name="android:statusBarColor">#060709</item>
-              </style>
+              <color name="ic_launcher_background">#0B0E13</color>
           </resources>
           EOF
 
-          cat > app/src/main/cpp/CMakeLists.txt <<'EOF'
-          cmake_minimum_required(VERSION 3.22)
-          project(vnxmem C)
-          add_executable(vnxmem vnxmem.c)
-          target_compile_options(vnxmem PRIVATE -O2 -static -Wall)
+          cat > app/src/main/res/drawable/ic_launcher_foreground.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <path android:fillColor="#39FF88" android:pathData="M54,22a32,32 0 1,0 0,64a32,32 0 1,0 0,-64z"/>
+              <path android:fillColor="#0B0E13" android:pathData="M54,31a23,23 0 1,0 0,46a23,23 0 1,0 0,-46z"/>
+              <path android:fillColor="#39FF88" android:pathData="M51,10h6v32h-6z M51,66h6v32h-6z M10,51h32v6h-32z M66,51h32v6h-32z"/>
+              <path android:fillColor="#FF3D71" android:pathData="M51,51h6v6h-6z"/>
+          </vector>
           EOF
 
-          cat > app/src/main/cpp/vnxmem.c <<'EOF'
-          #include <stdio.h>
-          #include <stdlib.h>
-          #include <string.h>
-          #include <fcntl.h>
-          #include <unistd.h>
-          #include <errno.h>
-          #include <math.h>
-          #include <sys/types.h>
-
-          #define CHUNK (1 << 20)
-          static pid_t g_pid = 0;
-          static int g_fd = -1;
-
-          static int mem_open(pid_t pid) {
-              char p[64];
-              snprintf(p, sizeof p, "/proc/%d/mem", pid);
-              g_fd = open(p, O_RDWR);
-              if (g_fd < 0) { fprintf(stderr, "open %s: %s\n", p, strerror(errno)); return -1; }
-              g_pid = pid; return 0;
-          }
-          static int rd(unsigned long a, void *b, size_t n) {
-              return pread(g_fd, b, n, (off_t)a) == (ssize_t)n ? 0 : -1;
-          }
-          static int rd_stable(unsigned long a, void *b, size_t n) {
-              unsigned char t[4096];
-              if (n > sizeof t) return -1;
-              if (rd(a, b, n)) return -1;
-              if (rd(a, t, n)) return -1;
-              return memcmp(b, t, n) ? -1 : 0;
-          }
-          static int wr(unsigned long a, const void *b, size_t n) {
-              return pwrite(g_fd, b, n, (off_t)a) == (ssize_t)n ? 0 : -1;
-          }
-          static void tracerpid(pid_t pid) {
-              char p[64], line[256];
-              snprintf(p, sizeof p, "/proc/%d/status", pid);
-              FILE *f = fopen(p, "r"); if (!f) return;
-              while (fgets(line, sizeof line, f))
-                  if (!strncmp(line, "TracerPid:", 10)) { printf("%s", line); break; }
-              fclose(f);
-          }
-          static int regions(pid_t pid) {
-              char p[64], line[512];
-              snprintf(p, sizeof p, "/proc/%d/maps", pid);
-              FILE *f = fopen(p, "r"); if (!f) return -1;
-              while (fgets(line, sizeof line, f)) {
-                  unsigned long a, b; char perm[8] = "", path[256] = "";
-                  if (sscanf(line, "%lx-%lx %7s %*s %*s %*s %255s", &a, &b, perm, path) >= 3)
-                      if (strchr(perm, 'r')) printf("%016lx-%016lx %s %s\n", a, b, perm, path);
-              }
-              fclose(f); return 0;
-          }
-          static unsigned long mod_base(pid_t pid, const char *mod, unsigned long *size) {
-              char p[64], line[512];
-              snprintf(p, sizeof p, "/proc/%d/maps", pid);
-              FILE *f = fopen(p, "r"); if (!f) return 0;
-              unsigned long lo = ~0UL, hi = 0;
-              while (fgets(line, sizeof line, f)) {
-                  unsigned long a, b; char perm[8] = "", path[512] = "";
-                  if (sscanf(line, "%lx-%lx %7s %*s %*s %*s %511s", &a, &b, perm, path) < 3) continue;
-                  if (!strstr(perm, "r-xp") && !strstr(perm, "r--p")) continue;
-                  if (strstr(path, mod)) { if (a < lo) lo = a; if (b > hi) hi = b; }
-              }
-              fclose(f);
-              if (!hi) return 0;
-              if (size) *size = hi - lo;
-              return lo;
-          }
-          static int pat_parse(const char *s, unsigned char *b, signed char *m, int *n) {
-              int i = 0;
-              while (*s && i < 128) {
-                  while (*s == ' ') s++;
-                  if (!*s) break;
-                  if (s[0] == '?' && s[1] == '?') { b[i] = 0; m[i] = 1; s += 2; }
-                  else { unsigned v; if (sscanf(s, "%2x", &v) != 1) break; b[i] = v; m[i] = 0; s += 2; }
-                  i++;
-              }
-              *n = i; return i > 0;
-          }
-          static int pat_find(unsigned long lo, unsigned long hi,
-                              const unsigned char *p, const signed char *m, int n, int max) {
-              unsigned char *buf = malloc(CHUNK + n);
-              if (!buf) return 0;
-              int hits = 0;
-              for (unsigned long a = lo; a + n < hi; a += CHUNK) {
-                  size_t want = (hi - a) < (CHUNK + n) ? (hi - a) : (CHUNK + n);
-                  if (rd(a, buf, want)) continue;
-                  for (size_t o = 0; o + n <= want; o++) {
-                      int ok = 1;
-                      for (int k = 0; k < n; k++) if (!m[k] && buf[o+k] != p[k]) { ok = 0; break; }
-                      if (ok) { printf("%016lx\n", a + o); if (++hits >= max) goto done; }
-                  }
-              }
-          done: free(buf); return hits;
-          }
-          static int hexb(const char *s, unsigned char *o) {
-              int n = 0;
-              while (s[0] && s[1]) { unsigned v; if (sscanf(s, "%2x", &v) != 1) break; o[n++] = v; s += 2; }
-              return n;
-          }
-          static int cmd_aim(pid_t pid, unsigned long cam, unsigned long me,
-                             unsigned long arr, int count, int stride, int posoff,
-                             float smooth, float fov) {
-              if (mem_open(pid)) return 1;
-              float mp[3], cp[2], ep[3];
-              for (;;) {
-                  if (rd(me + posoff, mp, 12)) { usleep(16000); continue; }
-                  if (rd(cam, cp, 8)) { usleep(16000); continue; }
-                  unsigned long best = 0; float bestd = fov * fov;
-                  for (int i = 0; i < count; i++) {
-                      unsigned long e = arr + (unsigned long)i * stride;
-                      if (stride == 8) { if (rd(e, &e, 8)) continue; }
-                      if (rd(e + posoff, ep, 12)) continue;
-                      float dx = ep[0]-mp[0], dz = ep[2]-mp[2];
-                      float d2 = dx*dx + dz*dz;
-                      if (d2 < bestd && d2 > 4.0f) { bestd = d2; best = e; }
-                  }
-                  if (!best) { usleep(16000); continue; }
-                  if (rd(best + posoff, ep, 12)) { usleep(16000); continue; }
-                  float dx = ep[0]-mp[0], dy = (ep[1]+1.65f)-mp[1], dz = ep[2]-mp[2];
-                  float yaw = atan2f(dx, dz) * 57.29578f;
-                  float pitch = atan2f(dy, sqrtf(dx*dx + dz*dz)) * 57.29578f;
-                  float d = yaw - cp[0];
-                  while (d > 180.f) d -= 360.f;
-                  while (d < -180.f) d += 360.f;
-                  float o[2] = { cp[0] + d * smooth, cp[1] + (pitch - cp[1]) * smooth };
-                  wr(cam, o, 8);
-                  usleep(15000);
-              }
-              return 0;
-          }
-          int main(int argc, char **argv) {
-              if (argc < 3) { fprintf(stderr, "usage: vnxmem <tracer|regions|find|read|write|scan|aim> <pid> [args]\n"); return 2; }
-              const char *cmd = argv[1];
-              pid_t pid = (pid_t)strtol(argv[2], NULL, 10);
-              if (!strcmp(cmd, "tracer")) { tracerpid(pid); return 0; }
-              if (!strcmp(cmd, "regions") || !strcmp(cmd, "mods")) return regions(pid);
-              if (!strcmp(cmd, "find") && argc >= 5) {
-                  unsigned long sz = 0;
-                  unsigned long base = mod_base(pid, argv[3], &sz);
-                  if (!base) { fprintf(stderr, "module not found\n"); return 1; }
-                  if (mem_open(pid)) return 1;
-                  unsigned char p[128]; signed char m[128]; int n = 0;
-                  if (!pat_parse(argv[4], p, m, &n)) return 2;
-                  pat_find(base, base + sz, p, m, n, argc >= 6 ? atoi(argv[5]) : 4);
-                  tracerpid(pid); return 0;
-              }
-              if (mem_open(pid)) return 1;
-              if (!strcmp(cmd, "read") && argc >= 5) {
-                  unsigned long a = strtoul(argv[3], NULL, 16);
-                  size_t n = (size_t)strtoul(argv[4], NULL, 10);
-                  unsigned char *b = malloc(n);
-                  if (rd_stable(a, b, n)) { free(b); return 1; }
-                  for (size_t i = 0; i < n; i++) printf("%02x", b[i]);
-                  printf("\n"); tracerpid(pid); free(b); return 0;
-              }
-              if (!strcmp(cmd, "write") && argc >= 5) {
-                  unsigned long a = strtoul(argv[3], NULL, 16);
-                  unsigned char buf[4096]; int n = hexb(argv[4], buf);
-                  if (wr(a, buf, n)) return 1;
-                  printf("ok %d bytes @ %016lx\n", n, a); tracerpid(pid); return 0;
-              }
-              if (!strcmp(cmd, "scan") && argc >= 5) {
-                  unsigned long lo = argc >= 6 ? strtoul(argv[5], NULL, 16) : 0x7a000000UL;
-                  unsigned long hi = argc >= 7 ? strtoul(argv[6], NULL, 16) : 0x80000000UL;
-                  char t = argv[3][0];
-                  size_t esz = (t=='f'||t=='w') ? 4 : 8;
-                  unsigned char pat[8];
-                  if (t=='f') { float f = strtof(argv[4], NULL); memcpy(pat, &f, 4); }
-                  else if (t=='d') { double d = strtod(argv[4], NULL); memcpy(pat, &d, 8); }
-                  else { unsigned long v = strtoul(argv[4], NULL, 0);
-                         for (size_t i = 0; i < esz; i++) pat[i] = (v >> (8*i)) & 0xff; }
-                  unsigned char *buf = malloc(CHUNK); int hits = 0;
-                  for (unsigned long p = lo; p + CHUNK < hi; p += CHUNK) {
-                      if (rd(p, buf, CHUNK)) continue;
-                      for (size_t o = 0; o + esz <= CHUNK; o++)
-                          if (!memcmp(buf + o, pat, esz)) { printf("%016lx\n", p + o); if (++hits >= 400) goto sd; }
-                  }
-              sd: free(buf); return 0;
-              }
-              if (!strcmp(cmd, "aim") && argc >= 11)
-                  return cmd_aim(pid, strtoul(argv[3], NULL, 16), strtoul(argv[4], NULL, 16),
-                                 strtoul(argv[5], NULL, 16), atoi(argv[6]), atoi(argv[7]),
-                                 atoi(argv[8]), strtof(argv[9], NULL), strtof(argv[10], NULL));
-              fprintf(stderr, "unknown cmd %s\n", cmd);
-              return 2;
-          }
+          cat > app/src/main/res/mipmap-anydpi/ic_launcher.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <path android:fillColor="#0B0E13" android:pathData="M0,0h108v108h-108z"/>
+              <path android:fillColor="#39FF88" android:pathData="M54,22a32,32 0 1,0 0,64a32,32 0 1,0 0,-64z"/>
+              <path android:fillColor="#0B0E13" android:pathData="M54,31a23,23 0 1,0 0,46a23,23 0 1,0 0,-46z"/>
+              <path android:fillColor="#39FF88" android:pathData="M51,10h6v32h-6z M51,66h6v32h-6z M10,51h32v6h-32z M66,51h32v6h-32z"/>
+              <path android:fillColor="#FF3D71" android:pathData="M51,51h6v6h-6z"/>
+          </vector>
           EOF
 
-          cat > app/src/main/java/ai/venice/vnx/core/Shell.kt <<'EOF'
-          package ai.venice.vnx.core
-          import rikka.shizuku.Shizuku
-          import java.io.BufferedReader
-          import java.io.BufferedWriter
-          object Shell {
-              private var proc: Process? = null
-              private var out: BufferedWriter? = null
-              private var reader: BufferedReader? = null
-              private const val EOF = "__VNX_EOF_9F3A__"
-              fun warm() {
-                  if (proc != null) return
-                  val p = Shizuku.newProcess(arrayOf("sh"), null, null)
-                  proc = p
-                  out = p.outputStream.bufferedWriter()
-                  reader = p.inputStream.bufferedReader()
-                  exec("echo ready")
-              }
-              @Synchronized
-              fun exec(cmd: String): String {
-                  if (proc == null) warm()
-                  val o = out ?: return ""
-                  val r = reader ?: return ""
-                  o.write(cmd + " 2>&1; echo " + EOF + "\n"); o.flush()
-                  val sb = StringBuilder()
-                  while (true) {
-                      val line = r.readLine() ?: break
-                      if (line == EOF) break
-                      sb.append(line).append('\n')
-                  }
-                  return sb.toString()
-              }
-              fun kill() { runCatching { proc?.destroy() }; proc = null; out = null; reader = null }
-          }
+          cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background"/>
+              <foreground android:drawable="@drawable/ic_launcher_foreground"/>
+          </adaptive-icon>
           EOF
 
-          cat > app/src/main/java/ai/venice/vnx/core/ShizukuGate.kt <<'EOF'
-          package ai.venice.vnx.core
+          cat > app/src/main/java/ai/venice/vnx/ShizukuGate.kt <<'EOF'
+          package ai.venice.vnx
+
           import android.content.pm.PackageManager
           import rikka.shizuku.Shizuku
+
           object ShizukuGate {
-              const val REQ = 4213
-              fun granted(): Boolean = try {
-                  Shizuku.pingBinder() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
-              } catch (t: Throwable) { false }
-              fun request() { runCatching { Shizuku.requestPermission(REQ) } }
-              fun arm() { if (granted()) Shell.warm() else request() }
+              private const val REQ = 1337
+              fun alive(): Boolean = runCatching { Shizuku.pingBinder() }.getOrDefault(false)
+              fun installed(): Boolean = runCatching { Shizuku.getVersion() > 0 }.getOrDefault(false)
+              fun granted(): Boolean = runCatching {
+                  alive() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+              }.getOrDefault(false)
+              fun request() {
+                  runCatching {
+                      if (!alive()) return@runCatching
+                      if (granted()) return@runCatching
+                      Shizuku.requestPermission(REQ)
+                  }
+              }
           }
           EOF
 
-          cat > app/src/main/java/ai/venice/vnx/core/Auth.kt <<'EOF'
-          package ai.venice.vnx.core
+          cat > app/src/main/java/ai/venice/vnx/Shell.kt <<'EOF'
+          package ai.venice.vnx
+
+          import rikka.shizuku.Shizuku
+
+          object Shell {
+              private const val MARK = "__VNX_MARK__"
+              private val lock = Any()
+              private var proc: Process? = null
+
+              private val newProcess by lazy {
+                  runCatching {
+                      Shizuku::class.java.getDeclaredMethod(
+                          "newProcess",
+                          Array<String>::class.java,
+                          Array<String>::class.java,
+                          String::class.java
+                      ).apply { isAccessible = true }
+                  }.getOrNull()
+              }
+
+              fun spawn(cmd: Array<String>): Process? =
+                  runCatching {
+                      newProcess?.invoke(null, *arrayOf<Any?>(cmd, null, null)) as? Process
+                  }.getOrNull()
+
+              fun alive(p: Process): Boolean =
+                  try { p.exitValue(); false } catch (e: IllegalThreadStateException) { true }
+
+              private fun warm(): Process? {
+                  proc?.let { if (alive(it)) return it }
+                  proc = null
+                  if (!ShizukuGate.granted()) return null
+                  val p = spawn(arrayOf("sh")) ?: return null
+                  proc = p
+                  runCatching {
+                      p.outputStream.write("echo ready\n".toByteArray())
+                      p.outputStream.flush()
+                      val buf = ByteArray(256)
+                      val end = System.currentTimeMillis() + 800L
+                      while (System.currentTimeMillis() < end) {
+                          if (p.inputStream.available() > 0) { p.inputStream.read(buf); break }
+                          Thread.sleep(5)
+                      }
+                  }
+                  return p
+              }
+
+              private fun drop() { runCatching { proc?.destroy() }; proc = null }
+
+              fun exec(cmd: String, timeoutMs: Long = 90_000L): String = synchronized(lock) {
+                  val p = warm() ?: return@synchronized "! shizuku not available"
+                  try {
+                      p.outputStream.write("$cmd 2>&1; echo $MARK\n".toByteArray())
+                      p.outputStream.flush()
+                  } catch (e: Exception) {
+                      drop(); return@synchronized "! shell write failed: ${e.message}"
+                  }
+                  val sb = StringBuilder()
+                  val buf = ByteArray(8192)
+                  val end = System.currentTimeMillis() + timeoutMs
+                  while (true) {
+                      try {
+                          if (p.inputStream.available() > 0) {
+                              val n = p.inputStream.read(buf)
+                              if (n <= 0) { drop(); return@synchronized "! shell closed" }
+                              sb.append(String(buf, 0, n))
+                              val i = sb.indexOf(MARK)
+                              if (i >= 0) return@synchronized sb.substring(0, i).trim()
+                          } else {
+                              if (!alive(p)) {
+                                  drop()
+                                  val s = sb.toString().trim()
+                                  return@synchronized if (s.isEmpty()) "! shell closed" else s
+                              }
+                              if (System.currentTimeMillis() > end)
+                                  return@synchronized "! timeout ${timeoutMs}ms"
+                              Thread.sleep(5)
+                          }
+                      } catch (e: Exception) {
+                          drop(); return@synchronized "! shell read failed: ${e.message}"
+                      }
+                  }
+                  ""
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/ai/venice/vnx/Auth.kt <<'EOF'
+          package ai.venice.vnx
+
           import android.content.Context
           import java.security.MessageDigest
+
           object Auth {
-              private const val SALT = "vnx::apex::v1"
-              private fun h(u: String, p: String) =
-                  MessageDigest.getInstance("SHA-256").digest((SALT + "|" + u + "|" + p).toByteArray())
-                      .joinToString("") { "%02x".format(it) }
+              private const val SALT = "vnx-apex-9f3a"
+              const val DEFAULT_USER = "venice"
+              const val DEFAULT_PASS = "venice"
+
+              private fun p(c: Context) = c.getSharedPreferences("vnx", Context.MODE_PRIVATE)
+
+              private fun h(s: String): String =
+                  MessageDigest.getInstance("SHA-256")
+                      .digest((SALT + s).toByteArray())
+                      .joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+
               fun seed(c: Context) {
-                  val sp = c.getSharedPreferences("auth", Context.MODE_PRIVATE)
-                  if (!sp.contains("venice")) sp.edit().putString("venice", h("venice", "venice")).apply()
+                  val sp = p(c)
+                  if (!sp.contains("u")) sp.edit()
+                      .putString("u", DEFAULT_USER).putString("h", h(DEFAULT_PASS)).apply()
               }
-              fun verify(c: Context, u: String, p: String): Boolean =
-                  c.getSharedPreferences("auth", Context.MODE_PRIVATE).getString(u, null) == h(u, p)
+
+              fun verify(c: Context, user: String, pass: String): Boolean {
+                  seed(c)
+                  val sp = p(c)
+                  return sp.getString("u", "") == user.trim() && sp.getString("h", "") == h(pass)
+              }
+
+              fun loggedIn(c: Context) = p(c).getBoolean("in", false)
+              fun login(c: Context) { p(c).edit().putBoolean("in", true).apply() }
+              fun logout(c: Context) { p(c).edit().putBoolean("in", false).apply() }
           }
           EOF
 
-          cat > app/src/main/java/ai/venice/vnx/native/Native.kt <<'EOF'
-          package ai.venice.vnx.native
-          import ai.venice.vnx.core.Shell
+          cat > app/src/main/java/ai/venice/vnx/Native.kt <<'EOF'
+          package ai.venice.vnx
+
           import android.content.Context
-          import rikka.shizuku.Shizuku
+          import android.os.Build
+
           object Native {
-              private const val DIR = "/data/local/tmp/vnxmem"
-              private var installed = false
-              fun install(ctx: Context, abi: String) {
-                  if (installed) return
-                  val bytes = ctx.assets.open("vnxmem-" + abi).readBytes()
-                  val p = Shizuku.newProcess(arrayOf("sh", "-c", "cat > " + DIR + " && chmod 755 " + DIR), null, null)
-                  p.outputStream.use { it.write(bytes) }
-                  p.waitFor()
-                  installed = true
+              const val DIR = "/data/local/tmp/vnx"
+              const val BIN = "$DIR/vnxmem"
+              private val installed = HashSet<String>()
+
+              private fun abi(ctx: Context): String? =
+                  Build.SUPPORTED_ABIS.firstOrNull { a ->
+                      runCatching { ctx.assets.open("vnxmem-$a").close(); true }.getOrDefault(false)
+                  }
+
+              fun install(ctx: Context): String {
+                  val a = abi(ctx) ?: return "! no helper for ${Build.SUPPORTED_ABIS.joinToString()}"
+                  synchronized(installed) {
+                      if (installed.contains(a)) return "helper already installed ($a)"
+                      val bytes = ctx.assets.open("vnxmem-$a").use { it.readBytes() }
+                      val script = "mkdir -p $DIR; cat > $BIN; chmod 755 $BIN; " +
+                          "test \"\$(stat -c%s $BIN)\" = \"${bytes.size}\" && test -x $BIN && echo OK"
+                      val p = Shell.spawn(arrayOf("sh", "-c", script)) ?: return "! cannot spawn sh"
+                      try { p.outputStream.use { it.write(bytes) } }
+                      catch (e: Exception) { return "! write failed: ${e.message}" }
+                      val out = p.inputStream.readBytes().toString(Charsets.UTF_8).trim()
+                      val code = p.waitFor()
+                      if (code != 0 || !out.contains("OK"))
+                          return "! install failed exit=$code out=$out want=${bytes.size}b"
+                      installed.add(a)
+                      return "helper installed ($a, ${bytes.size} bytes)"
+                  }
               }
-              fun tracer(pid: Int) = Shell.exec(DIR + " tracer " + pid).trim()
-              fun read(pid: Int, a: Long, n: Int) = Shell.exec(DIR + " read " + pid + " " + a.toString(16) + " " + n).trim()
-              fun find(pid: Int, mod: String, pat: String, max: Int = 4) =
-                  Shell.exec(DIR + " find " + pid + " " + mod + " \"" + pat + "\" " + max).lines().filter { it.length >= 12 }
+
+              private fun digits(s: String) = s.isNotEmpty() && s.all { it.isDigit() }
+
+              fun pid(): String {
+                  for (pkg in listOf("com.dts.freefireth", "com.dts.freefiremax")) {
+                      val d = Shell.exec("pidof $pkg").trim().split(" ").firstOrNull().orEmpty().trim()
+                      if (digits(d)) return d
+                      val ps = Shell.exec("ps -A -o PID,ARGS 2>/dev/null")
+                      val l = ps.lines().firstOrNull { it.trim().endsWith(" $pkg") }
+                      val v = l?.trim()?.split(" ")?.firstOrNull().orEmpty()
+                      if (digits(v)) return v
+                  }
+                  return ""
+              }
+
+              private fun need(pid: String) = if (pid.isBlank()) "! no pid" else null
+
+              fun probe(pid: String) = need(pid) ?: Shell.exec("$BIN probe $pid")
+              fun mods(pid: String) = need(pid) ?: Shell.exec("$BIN mods $pid")
+              fun tracer(pid: String) = need(pid) ?: Shell.exec("$BIN tracerpid $pid")
+              fun read(pid: String, a: String, n: String) = need(pid) ?: Shell.exec("$BIN read $pid $a $n")
+              fun write(pid: String, a: String, hx: String) = need(pid) ?: Shell.exec("$BIN write $pid $a $hx")
+              fun findm(pid: String, m: String, t: String, p: String) =
+                  need(pid) ?: Shell.exec("$BIN findm $pid $m $t '$p'", 240_000L)
+              fun fnew(pid: String, m: String, t: String, v: String) =
+                  need(pid) ?: Shell.exec("$BIN fnew $pid $m $t $v", 240_000L)
+              fun fnext(pid: String, t: String, v: String) = need(pid) ?: Shell.exec("$BIN fnext $pid $t $v")
+              fun frange(pid: String, t: String, lo: String, hi: String) =
+                  need(pid) ?: Shell.exec("$BIN frange $pid $t $lo $hi")
+              fun fshow(pid: String, n: String) = need(pid) ?: Shell.exec("$BIN fshow $pid $n")
+              fun fset(pid: String, i: String, t: String, v: String) =
+                  need(pid) ?: Shell.exec("$BIN fset $pid $i $t $v")
+              fun fsnap(pid: String) = need(pid) ?: Shell.exec("$BIN fsnap $pid")
+              fun frestore(pid: String) = need(pid) ?: Shell.exec("$BIN frestore $pid")
+              fun freset() = Shell.exec("$BIN freset")
+
+              fun aim(pid: String, cam: String, me: String, arr: String, count: String,
+                      stride: String, posoff: String, smooth: String, fov: String,
+                      mode: String, flags: String): String {
+                  if (pid.isBlank()) return "! no pid"
+                  val cmd = "$BIN aim $pid $cam $me $arr $count $stride $posoff $smooth $fov $mode $flags"
+                  Shell.exec("( $cmd ) > $DIR/aim.log 2>&1 < /dev/null & echo started")
+                  return "aim running -> $DIR/aim.log"
+              }
+
+              fun aimStop(): String {
+                  Shell.exec("pkill -f '$BIN aim' 2>/dev/null || true")
+                  return "aim stopped"
+              }
+
+              fun aimLog() = Shell.exec("tail -n 25 $DIR/aim.log 2>/dev/null || echo '(no log yet)'")
+
+              fun selfTest(ctx: Context, pid: String): String {
+                  val sb = StringBuilder()
+                  var pass = 0; var fail = 0
+                  fun step(n: String, ok: Boolean, d: String) {
+                      if (ok) pass++ else fail++
+                      sb.append(if (ok) "[PASS] " else "[FAIL] ").append(n)
+                      if (d.isNotEmpty()) sb.append(" :: ").append(d.take(110))
+                      sb.append('\n')
+                  }
+                  val inst = install(ctx)
+                  step("01 install helper", inst.startsWith("helper"), inst)
+                  if (pid.isBlank()) {
+                      step("02 game pid", false, "Free Fire not running")
+                      return sb.append('\n').append(pass).append(" pass / ").append(fail).append(" fail").toString()
+                  }
+                  step("02 game pid", true, pid)
+                  val pr = Shell.exec("$BIN probe $pid")
+                  step("03 memory access", pr.contains("RESULT: OK"),
+                       pr.lines().firstOrNull { it.startsWith("RESULT") } ?: pr.take(80))
+                  val tp = Shell.exec("$BIN tracerpid $pid").trim()
+                  step("04 tracerpid readable", tp.startsWith("tracerpid"), tp)
+                  val md = Shell.exec("$BIN mods $pid")
+                  val mc = md.lines().count { it.isNotBlank() && !it.startsWith("!") }
+                  step("05 list modules", mc > 3, "$mc modules")
+                  val fm = md.lines().firstOrNull()?.trim()?.split(" ")?.firstOrNull().orEmpty()
+                  if (fm.isNotEmpty()) {
+                      val rd = Shell.exec("$BIN read $pid 0x$fm 32")
+                      val hx = rd.lines().lastOrNull().orEmpty().trim()
+                      step("06 read memory", hx.length >= 32 && hx.all { it in "0123456789abcdefABCDEF" },
+                           "${hx.length} hex chars")
+                  } else step("06 read memory", false, "no module base")
+                  val f1 = Shell.exec("$BIN fnew $pid libil2cpp.so f 1.0", 240_000L)
+                  val n1 = Regex("set (\\d+)").find(f1)?.groupValues?.get(1)?.toIntOrNull() ?: -1
+                  step("07 first scan", n1 > 0, "candidates=$n1")
+                  if (n1 > 0) {
+                      val f2 = Shell.exec("$BIN fnext $pid f 1.0")
+                      val n2 = Regex("remaining (\\d+)").find(f2)?.groupValues?.get(1)?.toIntOrNull() ?: -1
+                      step("08 narrow", n2 in 1..n1, "remaining=$n2")
+                      val fs = Shell.exec("$BIN fshow $pid 3")
+                      step("09 show hits", fs.contains("count "), fs.lines().lastOrNull().orEmpty())
+                      step("10 snapshot", Shell.exec("$BIN fsnap $pid").contains("snapshot saved"), "ok")
+                      step("11 restore write", Shell.exec("$BIN frestore $pid").contains("restored"), "ok")
+                  } else {
+                      step("08 narrow", false, "no candidates")
+                      step("09 show hits", false, "skipped")
+                      step("10 snapshot", false, "skipped")
+                      step("11 restore write", false, "skipped")
+                  }
+                  Shell.exec("$BIN freset")
+                  step("12 filter reset", true, "cleared")
+                  return sb.append('\n').append(pass).append(" pass / ").append(fail).append(" fail").toString()
+              }
           }
           EOF
 
-          cat > app/src/main/java/ai/venice/vnx/antiflag/ReportCleaner.kt <<'EOF'
-          package ai.venice.vnx.antiflag
-          import ai.venice.vnx.core.Shell
-          object ReportCleaner {
-              private const val G = "/sdcard/Android/data/com.dts.freefireth"
-              private const val PKG = "com.dts.freefireth"
-              fun run(): List<String> = listOf(
-                  "am force-stop " + PKG,
-                  "rm -rf " + G + "/files/*.log " + G + "/cache/*",
-                  "am start -n " + PKG + "/com.dts.freefireth.FFMainActivity"
-              ).map { it to Shell.exec(it) }
-          }
-          EOF
+          cat > app/src/main/java/ai/venice/vnx/OverlaySvc.kt <<'EOF'
+          package ai.venice.vnx
 
-          cat > app/src/main/java/ai/venice/vnx/overlay/OverlaySvc.kt <<'EOF'
-          package ai.venice.vnx.overlay
-          import android.app.*
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
           import android.content.Intent
           import android.content.pm.ServiceInfo
+          import android.graphics.Color
           import android.graphics.PixelFormat
+          import android.graphics.Typeface
+          import android.os.Build
+          import android.os.Handler
           import android.os.IBinder
+          import android.os.Looper
           import android.view.Gravity
           import android.view.WindowManager
           import android.widget.TextView
+          import androidx.core.app.NotificationCompat
+
           class OverlaySvc : Service() {
-              private lateinit var wm: WindowManager
+              companion object {
+                  @Volatile var running = false
+                  @Volatile var status = "VNX APEX"
+                  private const val CH = "vnx"
+              }
+
+              private var wm: WindowManager? = null
               private var hud: TextView? = null
               private var orb: TextView? = null
+              private val ui = Handler(Looper.getMainLooper())
+              private val tick = object : Runnable {
+                  override fun run() { hud?.text = status; ui.postDelayed(this, 1000L) }
+              }
+
               override fun onBind(i: Intent?): IBinder? = null
-              override fun onStartCommand(i: Intent?, f: Int, s: Int): Int {
-                  startForeground(1, notif(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-                  if (hud == null) attach()
-                  return START_STICKY
+
+              override fun onCreate() {
+                  super.onCreate()
+                  running = true
+                  val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+                  nm.createNotificationChannel(
+                      NotificationChannel(CH, "VNX", NotificationManager.IMPORTANCE_LOW))
+                  val n = NotificationCompat.Builder(this, CH)
+                      .setContentTitle("VNX Apex")
+                      .setContentText("overlay active")
+                      .setSmallIcon(android.R.drawable.ic_menu_compass)
+                      .setOngoing(true)
+                      .setPriority(NotificationCompat.PRIORITY_LOW)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 34)
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  else
+                      startForeground(1, n)
+                  mount()
+                  ui.post(tick)
               }
-              private fun attach() {
-                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
-                  val hv = TextView(this).apply { text = "VNX"; setTextColor(0xFF5BF08A.toInt()) }
-                  val hp = WindowManager.LayoutParams(
-                      WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
-                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                      WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                      WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                      PixelFormat.TRANSLUCENT)
-                  wm.addView(hv, hp); hud = hv
-                  val ov = TextView(this).apply {
-                      text = "VNX"; setTextColor(0xFF5BF08A.toInt()); textSize = 9f
-                      setBackgroundColor(0x285BF08A); setPadding(24,24,24,24)
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun mount() {
+                  val w = getSystemService(WINDOW_SERVICE) as WindowManager
+                  wm = w
+                  val flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                              WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                  val h = TextView(this).apply {
+                      text = status
+                      setTextColor(Color.parseColor("#39FF88"))
+                      textSize = 11f
+                      typeface = Typeface.MONOSPACE
+                      setBackgroundColor(Color.parseColor("#99000000"))
+                      setPadding(dp(8), dp(4), dp(8), dp(4))
                   }
+                  val o = TextView(this).apply {
+                      text = "VNX"
+                      setTextColor(Color.parseColor("#39FF88"))
+                      textSize = 10f
+                      typeface = Typeface.MONOSPACE
+                      gravity = Gravity.CENTER
+                      setBackgroundColor(Color.parseColor("#66000000"))
+                  }
+                  hud = h; orb = o
+                  val hp = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      flags, PixelFormat.TRANSLUCENT
+                  ).apply { gravity = Gravity.TOP or Gravity.START; x = dp(12); y = dp(60) }
                   val op = WindowManager.LayoutParams(
-                      140, 140, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                      WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-                      PixelFormat.TRANSLUCENT).apply { gravity = Gravity.BOTTOM or Gravity.END; x = 40; y = 260 }
-                  wm.addView(ov, op); orb = ov
+                      dp(72), dp(72),
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      flags, PixelFormat.TRANSLUCENT
+                  ).apply { gravity = Gravity.TOP or Gravity.END; x = dp(12); y = dp(60) }
+                  runCatching { w.addView(h, hp) }
+                  runCatching { w.addView(o, op) }
               }
-              private fun notif(): Notification {
-                  val ch = NotificationChannel("vnx", "VNX", NotificationManager.IMPORTANCE_LOW)
-                  (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
-                  return Notification.Builder(this, "vnx")
-                      .setContentTitle("VNX Apex").setContentText("panel active")
-                      .setSmallIcon(android.R.drawable.ic_menu_compass).build()
-              }
+
               override fun onDestroy() {
-                  runCatching { hud?.let { wm.removeView(it) }; orb?.let { wm.removeView(it) } }
+                  running = false
+                  ui.removeCallbacks(tick)
+                  val w = wm; val h = hud; val o = orb
+                  if (w != null && h != null) runCatching { w.removeView(h) }
+                  if (w != null && o != null) runCatching { w.removeView(o) }
                   super.onDestroy()
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/ai/venice/vnx/ReportCleaner.kt <<'EOF'
+          package ai.venice.vnx
+
+          object ReportCleaner {
+              private val PKGS = listOf("com.dts.freefireth", "com.dts.freefiremax")
+
+              fun run(): String {
+                  val sb = StringBuilder()
+                  var found = false
+                  for (pkg in PKGS) {
+                      if (!Shell.exec("pm path $pkg").contains("package:")) continue
+                      found = true
+                      Shell.exec("am force-stop $pkg")
+                      for (root in listOf("/data/user/0/$pkg", "/data/data/$pkg")) {
+                          Shell.exec(
+                              "rm -f $root/files/*.log 2>/dev/null; " +
+                              "rm -rf $root/cache/* 2>/dev/null; " +
+                              "rm -rf $root/files/report* 2>/dev/null"
+                          )
+                      }
+                      Shell.exec("monkey -p $pkg -c android.intent.category.LAUNCHER 1 > /dev/null 2>&1")
+                      sb.append("$pkg cleared + relaunched\n")
+                  }
+                  return if (found) sb.toString().trim() else "! Free Fire not installed"
               }
           }
           EOF
 
           cat > app/src/main/java/ai/venice/vnx/MainActivity.kt <<'EOF'
           package ai.venice.vnx
+
+          import android.Manifest
           import android.content.Intent
           import android.content.pm.PackageManager
+          import android.net.Uri
           import android.os.Build
           import android.os.Bundle
+          import android.provider.Settings
           import androidx.activity.ComponentActivity
           import androidx.activity.compose.setContent
+          import androidx.activity.enableEdgeToEdge
           import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.rememberScrollState
           import androidx.compose.foundation.verticalScroll
-          import androidx.compose.material3.*
+          import androidx.compose.material3.Button
+          import androidx.compose.material3.ButtonDefaults
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.OutlinedTextField
+          import androidx.compose.material3.Surface
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.darkColorScheme
           import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
           import androidx.compose.ui.Modifier
           import androidx.compose.ui.graphics.Color
           import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.TextStyle
           import androidx.compose.ui.text.font.FontFamily
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.input.PasswordVisualTransformation
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
-          import ai.venice.vnx.core.Auth
-          import ai.venice.vnx.core.ShizukuGate
-          import ai.venice.vnx.native.Native
-          import ai.venice.vnx.overlay.OverlaySvc
-          import rikka.shizuku.Shizuku
+          import androidx.core.content.ContextCompat
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+
+          private val BG   = Color(0xFF0B0E13)
+          private val CARD = Color(0xFF141922)
+          private val ACC  = Color(0xFF39FF88)
+          private val DIM  = Color(0xFF7A8798)
+          private val RED  = Color(0xFFFF3D71)
+          private val FG   = Color(0xFFE6EDF5)
+          private val MONO = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 13.sp, color = FG)
+
           class MainActivity : ComponentActivity() {
-              override fun onCreate(s: Bundle?) {
-                  super.onCreate(s)
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  enableEdgeToEdge()
                   Auth.seed(this)
-                  Shizuku.addRequestPermissionResultListener { _, code ->
-                      if (code == PackageManager.PERMISSION_GRANTED) ShizukuGate.arm()
+                  setContent {
+                      MaterialTheme(colorScheme = darkColorScheme(
+                          background = BG, surface = CARD,
+                          primary = ACC, onPrimary = BG, onSurface = FG)) {
+                          Surface(Modifier.fillMaxSize().background(BG), color = BG) { Root() }
+                      }
                   }
-                  setContent { Root() }
               }
-              override fun onResume() { super.onResume(); ShizukuGate.arm() }
-          }
-          val BG = Color(0xFF060709); val LIME = Color(0xFF5BF08A)
-          @Composable fun Root() {
-              var ok by remember { mutableStateOf(ShizukuGate.granted()) }
-              var user by remember { mutableStateOf("") }
-              var pass by remember { mutableStateOf("") }
-              var logged by remember { mutableStateOf(false) }
-              val ctx = LocalContext.current
-              MaterialTheme(colorScheme = darkColorScheme(background = BG, surface = Color(0xFF0C0E12))) {
-                  Surface(Modifier.fillMaxSize().background(BG), color = BG) {
-                      Column(Modifier.padding(18.dp).verticalScroll(rememberScrollState())) {
-                          Text("VNX APEX", color = LIME, fontSize = 20.sp, fontFamily = FontFamily.Monospace)
-                          Spacer(Modifier.height(14.dp))
-                          if (!ok) {
-                              Text("SHIZUKU NOT RUNNING", color = Color(0xFFF2604E), fontFamily = FontFamily.Monospace)
-                              Spacer(Modifier.height(8.dp))
-                              Button(onClick = { ShizukuGate.request() }) { Text("Request / Retry") }
-                          } else if (!logged) {
-                              OutlinedTextField(user, { user = it }, label = { Text("username") }, Modifier.fillMaxWidth())
-                              Spacer(Modifier.height(8.dp))
-                              OutlinedTextField(pass, { pass = it }, label = { Text("password") }, Modifier.fillMaxWidth())
-                              Spacer(Modifier.height(12.dp))
-                              Button(onClick = { if (Auth.verify(ctx, user, pass)) logged = true }, Modifier.fillMaxWidth()) { Text("UNLOCK") }
-                          } else { Panel(ctx) }
+
+              override fun onResume() {
+                  super.onResume()
+                  if (!Settings.canDrawOverlays(this)) {
+                      runCatching {
+                          startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                              Uri.parse("package:$packageName")))
+                      }
+                  }
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+                          PackageManager.PERMISSION_GRANTED) {
+                      runCatching { requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 7) }
+                  }
+                  if (Settings.canDrawOverlays(this) && !OverlaySvc.running) {
+                      runCatching {
+                          ContextCompat.startForegroundService(this, Intent(this, OverlaySvc::class.java))
                       }
                   }
               }
           }
-          @Composable fun Panel(ctx: android.content.Context) {
-              var status by remember { mutableStateOf("idle") }
-              Text("status: " + status, color = LIME, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
-              Spacer(Modifier.height(14.dp))
-              Button(Modifier.fillMaxWidth(), onClick = {
-                  runCatching { Native.install(ctx, Build.SUPPORTED_ABIS.first()); status = "helper installed" }
-                      .onFailure { status = "install failed: " + it.message }
-              }) { Text("1 · INSTALL HELPER") }
-              Spacer(Modifier.height(8.dp))
-              Button(Modifier.fillMaxWidth(), onClick = {
-                  val r = ai.venice.vnx.core.Shell.exec("pidof com.dts.freefireth").trim()
-                  status = if (r.isEmpty()) "game not running" else "game pid " + r
-              }) { Text("2 · DETECT GAME") }
-              Spacer(Modifier.height(8.dp))
-              Button(Modifier.fillMaxWidth(), onClick = {
-                  val pid = ai.venice.vnx.core.Shell.exec("pidof com.dts.freefireth").trim().toIntOrNull()
-                  status = if (pid == null) "game not running" else "TracerPid = " + Native.tracer(pid)
-              }) { Text("3 · VERIFY ZERO-SURFACE") }
-              Spacer(Modifier.height(8.dp))
-              Button(Modifier.fillMaxWidth(), onClick = {
-                  ctx.startForegroundService(Intent(ctx, OverlaySvc::class.java)); status = "overlay started"
-              }) { Text("4 · START OVERLAY") }
-              Spacer(Modifier.height(8.dp))
-              Button(Modifier.fillMaxWidth(), onClick = {
-                  status = "ghost: " + ai.venice.vnx.antiflag.ReportCleaner.run().size + " steps"
-              }) { Text("5 · GHOST / DELETE REPORT") }
+
+          @Composable private fun Btn(l: String, c: Color = ACC, on: () -> Unit) {
+              Button(onClick = on, modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                  colors = ButtonDefaults.buttonColors(containerColor = c, contentColor = BG)) {
+                  Text(l, fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+              }
+          }
+
+          @Composable private fun Fld(l: String, v: String, hint: String = "", on: (String) -> Unit) {
+              Column(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
+                  Text(l, color = DIM, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                  OutlinedTextField(value = v, onValueChange = on, singleLine = true,
+                      modifier = Modifier.fillMaxWidth(),
+                      placeholder = { if (hint.isNotEmpty()) Text(hint, color = DIM, fontSize = 11.sp) },
+                      textStyle = MONO)
+              }
+          }
+
+          @Composable private fun Head(t: String) {
+              Text(t, color = ACC, fontSize = 11.sp, fontFamily = FontFamily.Monospace,
+                  letterSpacing = 2.sp, modifier = Modifier.padding(top = 12.dp, bottom = 2.dp))
+          }
+
+          @Composable private fun Root() {
+              val ctx = LocalContext.current
+              var shiz by remember { mutableStateOf(ShizukuGate.granted()) }
+              var inS by remember { mutableStateOf(Auth.loggedIn(ctx)) }
+              LaunchedEffect(Unit) { while (true) { shiz = ShizukuGate.granted(); delay(1200L) } }
+
+              if (!shiz) {
+                  Column(Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp),
+                      verticalArrangement = Arrangement.Center,
+                      horizontalAlignment = Alignment.CenterHorizontally) {
+                      Text("VNX APEX", color = ACC, fontSize = 26.sp,
+                          fontWeight = FontWeight.Bold, letterSpacing = 4.sp)
+                      Spacer(Modifier.height(12.dp))
+                      Text(if (ShizukuGate.installed()) "Shizuku is installed but not running"
+                           else "Shizuku is not installed", color = DIM, fontSize = 12.sp)
+                      Spacer(Modifier.height(4.dp))
+                      Text("start Shizuku, then tap below", color = DIM, fontSize = 11.sp)
+                      Spacer(Modifier.height(24.dp))
+                      Btn("REQUEST SHIZUKU") { ShizukuGate.request() }
+                  }
+                  return
+              }
+              if (!inS) { Login { inS = true }; return }
+              Panel { inS = false }
+          }
+
+          @Composable private fun Login(done: () -> Unit) {
+              val ctx = LocalContext.current
+              var u by remember { mutableStateOf(Auth.DEFAULT_USER) }
+              var p by remember { mutableStateOf("") }
+              var err by remember { mutableStateOf("") }
+
+              Column(Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp),
+                  verticalArrangement = Arrangement.Center) {
+                  Text("VNX APEX", color = ACC, fontSize = 24.sp,
+                      fontWeight = FontWeight.Bold, letterSpacing = 4.sp)
+                  Spacer(Modifier.height(6.dp))
+                  Text("default login: venice / venice", color = DIM, fontSize = 11.sp,
+                      fontFamily = FontFamily.Monospace)
+                  Spacer(Modifier.height(18.dp))
+                  Fld("USER", u) { u = it }
+                  Column(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
+                      Text("PASS", color = DIM, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                      OutlinedTextField(value = p, onValueChange = { p = it }, singleLine = true,
+                          visualTransformation = PasswordVisualTransformation(),
+                          modifier = Modifier.fillMaxWidth(), textStyle = MONO)
+                  }
+                  Spacer(Modifier.height(12.dp))
+                  Btn("ENTER") {
+                      if (Auth.verify(ctx, u, p)) { Auth.login(ctx); done() } else err = "bad credentials"
+                  }
+                  if (err.isNotEmpty()) {
+                      Spacer(Modifier.height(8.dp))
+                      Text(err, color = RED, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                  }
+              }
+          }
+
+          private val TABS = listOf("SETUP", "AIM", "SCAN", "FILTER")
+
+          @Composable private fun TabBar(sel: Int, on: (Int) -> Unit) {
+              Row(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+                  for (i in TABS.indices) {
+                      val a = i == sel
+                      Box(Modifier.weight(1f).padding(horizontal = 2.dp)
+                          .background(if (a) ACC else CARD).clickable { on(i) }
+                          .padding(vertical = 8.dp), contentAlignment = Alignment.Center) {
+                          Text(TABS[i], color = if (a) BG else DIM, fontSize = 10.sp,
+                              fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                      }
+                  }
+              }
+          }
+
+          @Composable private fun Panel(onLogout: () -> Unit) {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              var tab by remember { mutableStateOf(0) }
+              var pid by remember { mutableStateOf("") }
+              var cam by remember { mutableStateOf("0x0") }
+              var me by remember { mutableStateOf("0x0") }
+              var arr by remember { mutableStateOf("0x0") }
+              var count by remember { mutableStateOf("64") }
+              var stride by remember { mutableStateOf("8") }
+              var posoff by remember { mutableStateOf("0x0") }
+              var smooth by remember { mutableStateOf("0.35") }
+              var fov by remember { mutableStateOf("60") }
+              var mode by remember { mutableStateOf("e") }
+              var flags by remember { mutableStateOf("0") }
+              var module by remember { mutableStateOf("libil2cpp.so") }
+              var type by remember { mutableStateOf("f") }
+              var pattern by remember { mutableStateOf("") }
+              var addr by remember { mutableStateOf("0x0") }
+              var len by remember { mutableStateOf("64") }
+              var value by remember { mutableStateOf("0") }
+              var idx by remember { mutableStateOf("0") }
+              var lo by remember { mutableStateOf("0") }
+              var hi by remember { mutableStateOf("100") }
+              var outText by remember { mutableStateOf("ready") }
+              var busy by remember { mutableStateOf(false) }
+
+              fun go(b: suspend () -> String) {
+                  scope.launch {
+                      busy = true
+                      outText = withContext(Dispatchers.IO) {
+                          runCatching { b() }.getOrElse { "! ${it.message}" }
+                      }
+                      busy = false
+                  }
+              }
+
+              Column(Modifier.fillMaxSize().safeDrawingPadding()
+                  .verticalScroll(rememberScrollState()).padding(16.dp)) {
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
+                      verticalAlignment = Alignment.CenterVertically) {
+                      Text("VNX APEX", color = ACC, fontSize = 20.sp,
+                          fontWeight = FontWeight.Bold, letterSpacing = 3.sp)
+                      Text(if (busy) "WORKING" else "IDLE", color = if (busy) ACC else DIM,
+                          fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                  }
+                  TabBar(tab) { tab = it }
+
+                  if (tab == 0) {
+                      Head("1 - PREPARE")
+                      Btn("INSTALL HELPER") { go { Native.install(ctx) } }
+                      Btn("FIND GAME PID") { go {
+                          val v = Native.pid()
+                          if (v.isNotEmpty()) pid = v
+                          if (v.isEmpty()) "! Free Fire not running" else "pid=$v" } }
+                      Btn("RUN FULL SELF TEST") { go { Native.selfTest(ctx, pid) } }
+                      Btn("TEST MEMORY ACCESS") { go { Native.probe(pid) } }
+                      Btn("CHECK TRACER") { go { Native.tracer(pid) } }
+                      Btn("LIST MODULES") { go { Native.mods(pid) } }
+                      Head("OVERLAY")
+                      Btn("START OVERLAY") { go {
+                          ContextCompat.startForegroundService(ctx, Intent(ctx, OverlaySvc::class.java))
+                          "overlay started" } }
+                      Btn("CLEAR FF REPORTS + RELAUNCH", DIM) { go { ReportCleaner.run() } }
+                      Head("PID")
+                      Fld("PID", pid) { pid = it }
+                  }
+
+                  if (tab == 1) {
+                      Head("AIM CONFIG")
+                      Fld("CAMERA ADDRESS", cam) { cam = it }
+                      Row(Modifier.fillMaxWidth()) {
+                          Box(Modifier.weight(1f)) { Fld("LOCAL PLAYER", me) { me = it } }
+                          Spacer(Modifier.width(8.dp))
+                          Box(Modifier.weight(1f)) { Fld("ENTITY ARRAY", arr) { arr = it } }
+                      }
+                      Row(Modifier.fillMaxWidth()) {
+                          Box(Modifier.weight(1f)) { Fld("COUNT", count) { count = it } }
+                          Spacer(Modifier.width(8.dp))
+                          Box(Modifier.weight(1f)) { Fld("STRIDE 4 or 8", stride) { stride = it } }
+                      }
+                      Row(Modifier.fillMaxWidth()) {
+                          Box(Modifier.weight(1f)) { Fld("POS OFFSET", posoff) { posoff = it } }
+                          Spacer(Modifier.width(8.dp))
+                          Box(Modifier.weight(1f)) { Fld("SMOOTH 0-1", smooth) { smooth = it } }
+                      }
+                      Row(Modifier.fillMaxWidth()) {
+                          Box(Modifier.weight(1f)) { Fld("FOV m 0=off", fov) { fov = it } }
+                          Spacer(Modifier.width(8.dp))
+                          Box(Modifier.weight(1f)) { Fld("MODE e|q", mode) { mode = it } }
+                      }
+                      Fld("FLAGS 1 assist 2 pitch 4 invert 8 zup", flags) { flags = it }
+                      Spacer(Modifier.height(8.dp))
+                      Btn("START AIM") { go {
+                          OverlaySvc.status = "AIM ON"
+                          Native.aim(pid, cam, me, arr, count, stride, posoff, smooth, fov, mode, flags) } }
+                      Btn("STOP AIM", RED) { go { OverlaySvc.status = "VNX APEX"; Native.aimStop() } }
+                      Btn("AIM LOG", DIM) { go { Native.aimLog() } }
+                  }
+
+                  if (tab == 2) {
+                      Head("PATTERN SCAN")
+                      Fld("MODULE", module) { module = it }
+                      Row(Modifier.fillMaxWidth()) {
+                          Box(Modifier.weight(1f)) { Fld("TYPE b w f d x", type) { type = it } }
+                          Spacer(Modifier.width(8.dp))
+                          Box(Modifier.weight(1f)) { Fld("PATTERN", pattern, "48 8B ?? 05") { pattern = it } }
+                      }
+                      Btn("FIND IN MODULE") { go { Native.findm(pid, module, type, pattern) } }
+                      Head("DIRECT MEMORY")
+                      Row(Modifier.fillMaxWidth()) {
+                          Box(Modifier.weight(1f)) { Fld("ADDRESS", addr) { addr = it } }
+                          Spacer(Modifier.width(8.dp))
+                          Box(Modifier.weight(1f)) { Fld("LENGTH", len) { len = it } }
+                      }
+                      Btn("READ", DIM) { go { Native.read(pid, addr, len) } }
+                      Fld("HEX BYTES", value, "00 00 80 3f") { value = it }
+                      Btn("WRITE", DIM) { go { Native.write(pid, addr, value) } }
+                  }
+
+                  if (tab == 3) {
+                      Head("VALUE FILTER")
+                      Text("b byte  w int16  h uint16  x int32  f float  d double",
+                          color = DIM, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                      Spacer(Modifier.height(6.dp))
+                      Fld("MODULE  (- = heap)", module) { module = it }
+                      Row(Modifier.fillMaxWidth()) {
+                          Box(Modifier.weight(1f)) { Fld("TYPE", type) { type = it } }
+                          Spacer(Modifier.width(8.dp))
+                          Box(Modifier.weight(1f)) { Fld("VALUE", value) { value = it } }
+                      }
+                      Btn("NEW SEARCH") { go { Native.fnew(pid, module, type, value) } }
+                      Btn("FILTER EQUAL") { go { Native.fnext(pid, type, value) } }
+                      Row(Modifier.fillMaxWidth()) {
+                          Box(Modifier.weight(1f)) { Fld("MIN", lo) { lo = it } }
+                          Spacer(Modifier.width(8.dp))
+                          Box(Modifier.weight(1f)) { Fld("MAX", hi) { hi = it } }
+                      }
+                      Btn("FILTER RANGE") { go { Native.frange(pid, type, lo, hi) } }
+                      Btn("SHOW RESULTS") { go { Native.fshow(pid, "40") } }
+                      Row(Modifier.fillMaxWidth()) {
+                          Box(Modifier.weight(1f)) { Fld("INDEX", idx) { idx = it } }
+                          Spacer(Modifier.width(8.dp))
+                          Box(Modifier.weight(1f)) { Fld("VALUE", value) { value = it } }
+                      }
+                      Btn("WRITE INDEX") { go { Native.fset(pid, idx, type, value) } }
+                      Btn("SNAPSHOT", DIM) { go { Native.fsnap(pid) } }
+                      Btn("RESTORE SNAPSHOT", DIM) { go { Native.frestore(pid) } }
+                      Btn("RESET FILTER", DIM) { go { Native.freset() } }
+                  }
+
+                  Head("OUTPUT")
+                  Text(outText, color = DIM, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                  Spacer(Modifier.height(16.dp))
+                  Btn("LOG OUT", DIM) { Auth.logout(ctx); onLogout() }
+                  Spacer(Modifier.height(24.dp))
+              }
           }
           EOF
 
-          echo "scaffold complete"
+          cat > app/src/main/cpp/vnxmem.c <<'VNXC'
+          #define _GNU_SOURCE
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <stdint.h>
+          #include <unistd.h>
+          #include <fcntl.h>
+          #include <errno.h>
+          #include <ctype.h>
+          #include <math.h>
+          #include <time.h>
+          #include <signal.h>
+          #include <sys/uio.h>
+          #include <sys/types.h>
 
-      - name: Build native helpers (3 ABIs)
+          #define VERSION "1.0"
+          #define CHUNK   (1u << 20)
+          #define MAXMAPS 8192
+          #define MAXMODS 512
+          #define MAXF    400000
+          #define MAXPAT  256
+          #define SCAN_CAP (640ull << 20)
+          #define RAD2DEG (180.0 / 3.14159265358979323846)
+
+          static pid_t g_pid = 0;
+          static int   g_memfd = -1;
+          static int   g_vm_ok = 0;
+          static int   g_ptr = 8;
+
+          typedef struct { uint64_t s, e; char perms[5]; char name[256]; } Map;
+          static Map g_maps[MAXMAPS];
+          static int g_nmaps = 0;
+
+          typedef struct { char name[256]; uint64_t s, e; } Mod;
+          static Mod g_mods[MAXMODS];
+          static int g_nmods = 0;
+
+          static uint64_t g_f[MAXF];
+          static size_t   g_fn = 0;
+          static uint8_t  g_fsnap[MAXF][8];
+          static size_t   g_fsnapn = 0;
+          static char     g_ftype = 'f';
+
+          static void die(const char *m) { fprintf(stderr, "! %s\n", m); exit(1); }
+
+          static size_t tsize(char t) {
+              switch (t) {
+                  case 'b': return 1;
+                  case 'w': return 2;
+                  case 'f': return 4;
+                  case 'd': return 8;
+                  case 'h': return 2;
+                  case 'x': return 4;
+                  default:  return 4;
+              }
+          }
+          static int valid_type(char t) {
+              return t=='b'||t=='w'||t=='f'||t=='d'||t=='h'||t=='x';
+          }
+
+          static ssize_t mem_read(uint64_t addr, void *buf, size_t n) {
+              if (g_vm_ok) {
+                  struct iovec lo; struct iovec re;
+                  lo.iov_base = buf; lo.iov_len = n;
+                  re.iov_base = (void *)(uintptr_t)addr; re.iov_len = n;
+                  ssize_t r = process_vm_readv(g_pid, &lo, 1, &re, 1, 0);
+                  if (r > 0) return r;
+              }
+              if (g_memfd >= 0) return pread(g_memfd, buf, n, (off_t)addr);
+              return -1;
+          }
+
+          static ssize_t mem_write(uint64_t addr, const void *buf, size_t n) {
+              if (g_vm_ok) {
+                  struct iovec lo; struct iovec re;
+                  lo.iov_base = (void *)buf; lo.iov_len = n;
+                  re.iov_base = (void *)(uintptr_t)addr; re.iov_len = n;
+                  ssize_t r = process_vm_writev(g_pid, &lo, 1, &re, 1, 0);
+                  if (r > 0) return r;
+              }
+              if (g_memfd >= 0) return pwrite(g_memfd, buf, n, (off_t)addr);
+              return -1;
+          }
+
+          static int read_ptr(uint64_t addr, uint64_t *out) {
+              uint8_t b[8];
+              uint64_t v = 0;
+              int i;
+              memset(b, 0, sizeof b);
+              if (mem_read(addr, b, (size_t)g_ptr) != (ssize_t)g_ptr) return 0;
+              for (i = g_ptr - 1; i >= 0; --i) v = (v << 8) | b[i];
+              *out = v;
+              return 1;
+          }
+
+          static int read_vec3(uint64_t addr, float *x, float *y, float *z) {
+              float v[3];
+              if (mem_read(addr, v, sizeof v) != (ssize_t)sizeof v) return 0;
+              *x = v[0]; *y = v[1]; *z = v[2];
+              return 1;
+          }
+
+          static int load_maps(pid_t pid) {
+              char path[64];
+              char line[1024];
+              FILE *f;
+              snprintf(path, sizeof path, "/proc/%d/maps", pid);
+              f = fopen(path, "r");
+              if (!f) return 0;
+              g_nmaps = 0; g_nmods = 0;
+              while (fgets(line, sizeof line, f) && g_nmaps < MAXMAPS) {
+                  unsigned long long a = 0, b = 0;
+                  char perms[8];
+                  char *p;
+                  Map *m;
+                  memset(perms, 0, sizeof perms);
+                  if (sscanf(line, "%llx-%llx %7s", &a, &b, perms) != 3) continue;
+                  m = &g_maps[g_nmaps++];
+                  m->s = (uint64_t)a; m->e = (uint64_t)b;
+                  memcpy(m->perms, perms, 4); m->perms[4] = 0;
+                  m->name[0] = 0;
+                  p = strchr(line, '/');
+                  if (p) {
+                      size_t n = strlen(p);
+                      if (n && p[n-1] == '\n') p[--n] = 0;
+                      if (n >= sizeof m->name) n = sizeof m->name - 1;
+                      memcpy(m->name, p, n); m->name[n] = 0;
+                      {
+                          int found = -1;
+                          int i;
+                          for (i = 0; i < g_nmods; ++i)
+                              if (!strcmp(g_mods[i].name, m->name)) { found = i; break; }
+                          if (found >= 0) {
+                              if (m->s < g_mods[found].s) g_mods[found].s = m->s;
+                              if (m->e > g_mods[found].e) g_mods[found].e = m->e;
+                          } else if (g_nmods < MAXMODS) {
+                              Mod *md = &g_mods[g_nmods++];
+                              snprintf(md->name, sizeof md->name, "%s", m->name);
+                              md->s = m->s; md->e = m->e;
+                          }
+                      }
+                  }
+              }
+              fclose(f);
+              return g_nmaps > 0;
+          }
+
+          static Mod *find_mod(const char *name) {
+              int i;
+              for (i = 0; i < g_nmods; ++i)
+                  if (!strcmp(g_mods[i].name, name)) return &g_mods[i];
+              for (i = 0; i < g_nmods; ++i) {
+                  size_t ln = strlen(name), lm = strlen(g_mods[i].name);
+                  if (ln <= lm && !strcmp(g_mods[i].name + (lm - ln), name)) return &g_mods[i];
+              }
+              return NULL;
+          }
+
+          static int open_target(pid_t pid) {
+              char p[64];
+              uint64_t probe = 0;
+              uint8_t b[16];
+              int i;
+              g_pid = pid; g_ptr = 8;
+              snprintf(p, sizeof p, "/proc/%d/mem", pid);
+              g_memfd = open(p, O_RDWR);
+              if (g_memfd < 0) g_memfd = open(p, O_RDONLY);
+              if (!load_maps(pid)) { fprintf(stderr, "! cannot read maps\n"); return 0; }
+              for (i = 0; i < g_nmaps; ++i)
+                  if (g_maps[i].perms[0] == 'r') { probe = g_maps[i].s; break; }
+              if (!probe) { fprintf(stderr, "! no readable mapping\n"); return 0; }
+              if (mem_read(probe, b, sizeof b) == (ssize_t)sizeof b) g_vm_ok = 1;
+              else if (g_memfd >= 0 && pread(g_memfd, b, sizeof b, (off_t)probe) == (ssize_t)sizeof b) g_vm_ok = 0;
+              else { fprintf(stderr, "! cannot read target memory errno=%d\n", errno); return 0; }
+              return 1;
+          }
+
+          static double bytes_to_d(const uint8_t *b, char t) {
+              switch (t) {
+                  case 'b': return (double)(int8_t)b[0];
+                  case 'w': { int16_t v; memcpy(&v, b, 2); return v; }
+                  case 'h': { uint16_t v; memcpy(&v, b, 2); return v; }
+                  case 'f': { float v; memcpy(&v, b, 4); return v; }
+                  case 'd': { double v; memcpy(&v, b, 8); return v; }
+                  case 'x': { int32_t v; memcpy(&v, b, 4); return v; }
+              }
+              return 0;
+          }
+
+          static void d_to_bytes(double d, char t, uint8_t *b) {
+              memset(b, 0, 8);
+              switch (t) {
+                  case 'b': { int8_t v = (int8_t)d; memcpy(b, &v, 1); break; }
+                  case 'w': { int16_t v = (int16_t)d; memcpy(b, &v, 2); break; }
+                  case 'h': { uint16_t v = (uint16_t)d; memcpy(b, &v, 2); break; }
+                  case 'f': { float v = (float)d; memcpy(b, &v, 4); break; }
+                  case 'd': { double v = d; memcpy(b, &v, 8); break; }
+                  case 'x': { int32_t v = (int32_t)d; memcpy(b, &v, 4); break; }
+              }
+          }
+
+          static int eq_value(const uint8_t *b, char t, double want) {
+              switch (t) {
+                  case 'f': { float a; memcpy(&a, b, 4); return fabsf(a - (float)want) <= 1e-6f; }
+                  case 'd': { double a; memcpy(&a, b, 8); return fabs(a - want) <= 1e-9; }
+                  default:  return bytes_to_d(b, t) == want;
+              }
+          }
+
+          static int cmd_help(void) {
+              printf("vnxmem %s\n", VERSION);
+              printf("usage: vnxmem <cmd> <pid> [args]\n");
+              printf("  probe tracerpid mods read write findm\n");
+              printf("  fnew fnext frange fshow fset fsnap frestore freset\n");
+              printf("  aim <pid> <cam> <me> <arr> <count> <stride> <posoff> <smooth> <fov> <mode> <flags>\n");
+              printf("  types b w h x f d | mode e|q | flags 1 assist 2 pitch 4 invert 8 zup\n");
+              return 0;
+          }
+
+          static int cmd_probe(pid_t pid) {
+              uint64_t probe = 0;
+              uint8_t b[32];
+              int i;
+              if (!open_target(pid)) { printf("RESULT: FAIL open\n"); return 1; }
+              for (i = 0; i < g_nmaps; ++i)
+                  if (g_maps[i].perms[0] == 'r') { probe = g_maps[i].s; break; }
+              if (mem_read(probe, b, sizeof b) == (ssize_t)sizeof b) {
+                  printf("RESULT: OK backend=%s ptr=%d addr=0x%llx\n",
+                         g_vm_ok ? "process_vm_readv" : "procpidmem", g_ptr,
+                         (unsigned long long)probe);
+                  return 0;
+              }
+              printf("RESULT: FAIL read errno=%d\n", errno);
+              return 1;
+          }
+
+          static int cmd_tracerpid(pid_t pid) {
+              char p[64], buf[64];
+              FILE *f;
+              snprintf(p, sizeof p, "/proc/%d/status", pid);
+              f = fopen(p, "r");
+              if (!f) { printf("tracerpid %d -1\n", pid); return 1; }
+              while (fgets(buf, sizeof buf, f)) {
+                  if (!strncmp(buf, "TracerPid:", 10)) {
+                      printf("tracerpid %d %ld\n", pid, strtol(buf + 10, NULL, 10));
+                      fclose(f); return 0;
+                  }
+              }
+              fclose(f);
+              printf("tracerpid %d 0\n", pid);
+              return 0;
+          }
+
+          static int cmd_mods(pid_t pid) {
+              int i;
+              if (!open_target(pid)) return 1;
+              for (i = 0; i < g_nmods; ++i)
+                  printf("%llx %s\n", (unsigned long long)g_mods[i].s, g_mods[i].name);
+              return 0;
+          }
+
+          static int cmd_read(pid_t pid, uint64_t addr, size_t len) {
+              uint8_t *buf;
+              ssize_t r;
+              ssize_t i;
+              if (!open_target(pid)) return 1;
+              if (!len) len = 64;
+              if (len > 4096) len = 4096;
+              buf = malloc(len);
+              if (!buf) die("oom");
+              r = mem_read(addr, buf, len);
+              if (r <= 0) { printf("! read failed errno=%d\n", errno); free(buf); return 1; }
+              printf("read 0x%llx %zd bytes\n", (unsigned long long)addr, r);
+              for (i = 0; i < r; ++i) printf("%02x", buf[i]);
+              printf("\n");
+              free(buf);
+              return 0;
+          }
+
+          static int parse_hexbytes(const char *s, uint8_t *out, size_t max) {
+              size_t n = 0;
+              while (*s && n < max) {
+                  char t[3];
+                  while (*s == ' ' || *s == ',') ++s;
+                  if (!isxdigit((unsigned char)*s)) break;
+                  t[0] = *s; t[1] = 0; t[2] = 0;
+                  ++s;
+                  if (isxdigit((unsigned char)*s)) { t[1] = *s; ++s; }
+                  out[n++] = (uint8_t)strtoul(t, NULL, 16);
+              }
+              return (int)n;
+          }
+
+          static int cmd_write(pid_t pid, uint64_t addr, const char *hex) {
+              uint8_t buf[512];
+              int n;
+              if (!open_target(pid)) return 1;
+              n = parse_hexbytes(hex, buf, sizeof buf);
+              if (n <= 0) { printf("! no bytes in '%s'\n", hex); return 1; }
+              if (mem_write(addr, buf, (size_t)n) != n) { printf("! write failed errno=%d\n", errno); return 1; }
+              printf("wrote %d bytes at 0x%llx\n", n, (unsigned long long)addr);
+              return 0;
+          }
+
+          static int cmd_findm(pid_t pid, const char *mod, const char *type, const char *pat) {
+              uint8_t pb[MAXPAT], pm[MAXPAT];
+              int pn = 0;
+              const char *p;
+              uint64_t start, end, a;
+              uint8_t *buf;
+              size_t hits = 0;
+              Mod *m;
+              if (!open_target(pid)) return 1;
+              if (!valid_type(type[0])) die("bad type");
+              m = find_mod(mod);
+              if (!m) { printf("! module '%s' not found\n", mod); return 1; }
+              p = pat;
+              while (*p && pn < MAXPAT) {
+                  while (*p == ' ') ++p;
+                  if (!*p) break;
+                  if (*p == '?' || *p == '*') { pb[pn] = 0; pm[pn] = 0; ++pn; ++p; if (*p == '?') ++p; }
+                  else if (isxdigit((unsigned char)*p)) {
+                      char t[3];
+                      t[0] = *p; t[1] = 0; t[2] = 0;
+                      ++p;
+                      if (isxdigit((unsigned char)*p)) { t[1] = *p; ++p; }
+                      pb[pn] = (uint8_t)strtoul(t, NULL, 16); pm[pn] = 1; ++pn;
+                  } else ++p;
+              }
+              if (!pn) { printf("! empty pattern\n"); return 1; }
+              start = m->s; end = m->e;
+              if (end - start > SCAN_CAP) end = start + SCAN_CAP;
+              buf = malloc(CHUNK);
+              if (!buf) die("oom");
+              for (a = start; a < end; a += CHUNK) {
+                  size_t want = (size_t)((end - a) < CHUNK ? (end - a) : CHUNK);
+                  ssize_t r = mem_read(a, buf, want);
+                  size_t lim, i;
+                  if (r <= 0) continue;
+                  lim = (size_t)r;
+                  for (i = 0; i + (size_t)pn <= lim; ++i) {
+                      int ok = 1, k;
+                      for (k = 0; k < pn; ++k)
+                          if (pm[k] && buf[i + k] != pb[k]) { ok = 0; break; }
+                      if (ok) {
+                          if (hits < 32) printf("hit %llx\n", (unsigned long long)(a + i));
+                          ++hits;
+                      }
+                  }
+              }
+              printf("found %zu in %s\n", hits, m->name);
+              free(buf);
+              return 0;
+          }
+
+          static void scan_region(uint64_t s, uint64_t e, char t, double want) {
+              size_t ts = tsize(t);
+              uint8_t *buf;
+              uint64_t a;
+              if (e - s > SCAN_CAP) e = s + SCAN_CAP;
+              buf = malloc(CHUNK);
+              if (!buf) die("oom");
+              for (a = s; a < e; a += CHUNK) {
+                  size_t want_len = (size_t)((e - a) < CHUNK ? (e - a) : CHUNK);
+                  ssize_t r = mem_read(a, buf, want_len);
+                  size_t lim, off;
+                  if (r <= 0) continue;
+                  lim = (size_t)r;
+                  for (off = 0; off + ts <= lim; off += ts) {
+                      if (g_fn >= MAXF) break;
+                      if (eq_value(buf + off, t, want)) g_f[g_fn++] = a + off;
+                  }
+              }
+              free(buf);
+          }
+
+          static int cmd_fnew(pid_t pid, const char *mod, char t, const char *v) {
+              double want;
+              int i;
+              if (!open_target(pid)) return 1;
+              if (!valid_type(t)) die("bad type");
+              g_fn = 0; g_ftype = t; g_fsnapn = 0;
+              want = strtod(v, NULL);
+              if (!strcmp(mod, "-") || !strcmp(mod, "all") || !strcmp(mod, "heap")) {
+                  for (i = 0; i < g_nmaps; ++i) {
+                      if (g_maps[i].perms[0] != 'r') continue;
+                      if (g_maps[i].name[0]) continue;
+                      scan_region(g_maps[i].s, g_maps[i].e, t, want);
+                      if (g_fn >= MAXF) break;
+                  }
+              } else {
+                  Mod *m = find_mod(mod);
+                  if (!m) { printf("! module '%s' not found\n", mod); return 1; }
+                  scan_region(m->s, m->e, t, want);
+              }
+              printf("RESULT: set %zu candidates type=%c value=%s\n", g_fn, t, v);
+              return 0;
+          }
+
+          static int cmd_fnext(pid_t pid, char t, const char *v) {
+              double want;
+              size_t w = 0, ts = tsize(t), i;
+              uint8_t b[8];
+              if (!open_target(pid)) return 1;
+              want = strtod(v, NULL);
+              for (i = 0; i < g_fn; ++i) {
+                  if (mem_read(g_f[i], b, ts) != (ssize_t)ts) continue;
+                  if (eq_value(b, t, want)) g_f[w++] = g_f[i];
+              }
+              g_fn = w;
+              printf("remaining %zu\n", g_fn);
+              return 0;
+          }
+
+          static int cmd_frange(pid_t pid, char t, const char *lo, const char *hi) {
+              double a, b2;
+              size_t w = 0, ts = tsize(t), i;
+              uint8_t b[8];
+              if (!open_target(pid)) return 1;
+              a = strtod(lo, NULL); b2 = strtod(hi, NULL);
+              for (i = 0; i < g_fn; ++i) {
+                  double d;
+                  if (mem_read(g_f[i], b, ts) != (ssize_t)ts) continue;
+                  d = bytes_to_d(b, t);
+                  if (d >= a && d <= b2) g_f[w++] = g_f[i];
+              }
+              g_fn = w;
+              printf("remaining %zu\n", g_fn);
+              return 0;
+          }
+
+          static int cmd_fshow(pid_t pid, size_t limit) {
+              size_t ts, shown = 0, i;
+              uint8_t b[8];
+              if (!open_target(pid)) return 1;
+              if (!limit) limit = 32;
+              ts = tsize(g_ftype);
+              printf("count %zu\n", g_fn);
+              for (i = 0; i < g_fn && shown < limit; ++i) {
+                  if (mem_read(g_f[i], b, ts) != (ssize_t)ts) continue;
+                  printf("[%zu] 0x%llx = %.6f\n", i, (unsigned long long)g_f[i], bytes_to_d(b, g_ftype));
+                  ++shown;
+              }
+              return 0;
+          }
+
+          static int cmd_fset(pid_t pid, size_t idx, char t, const char *v) {
+              uint8_t b[8];
+              if (!open_target(pid)) return 1;
+              if (idx >= g_fn) { printf("! index out of range (%zu)\n", g_fn); return 1; }
+              d_to_bytes(strtod(v, NULL), t, b);
+              if (mem_write(g_f[idx], b, tsize(t)) <= 0) { printf("! write failed\n"); return 1; }
+              printf("wrote [%zu] 0x%llx = %s\n", idx, (unsigned long long)g_f[idx], v);
+              return 0;
+          }
+
+          static int cmd_fsnap(pid_t pid) {
+              size_t ts, i;
+              if (!open_target(pid)) return 1;
+              ts = tsize(g_ftype);
+              g_fsnapn = 0;
+              for (i = 0; i < g_fn; ++i)
+                  if (mem_read(g_f[i], g_fsnap[i], ts) == (ssize_t)ts) ++g_fsnapn;
+              printf("snapshot saved %zu values\n", g_fsnapn);
+              return 0;
+          }
+
+          static int cmd_frestore(pid_t pid) {
+              size_t ts, n = 0, i;
+              if (!open_target(pid)) return 1;
+              if (!g_fsnapn) { printf("! no snapshot\n"); return 1; }
+              ts = tsize(g_ftype);
+              for (i = 0; i < g_fsnapn && i < g_fn; ++i)
+                  if (mem_write(g_f[i], g_fsnap[i], ts) > 0) ++n;
+              printf("restored %zu values\n", n);
+              return 0;
+          }
+
+          static double norm_deg(double d) {
+              while (d > 180.0) d -= 360.0;
+              while (d < -180.0) d += 360.0;
+              return d;
+          }
+
+          static void slerp_quat(float *cur, const float *tgt, float s) {
+              float d = cur[0]*tgt[0] + cur[1]*tgt[1] + cur[2]*tgt[2] + cur[3]*tgt[3];
+              float t[4];
+              int i;
+              t[0] = tgt[0]; t[1] = tgt[1]; t[2] = tgt[2]; t[3] = tgt[3];
+              if (d < 0.0f) { d = -d; for (i = 0; i < 4; ++i) t[i] = -t[i]; }
+              if (d > 0.9995f) { for (i = 0; i < 4; ++i) cur[i] += (t[i] - cur[i]) * s; }
+              else {
+                  float th = acosf(d), sn = sinf(th);
+                  float a = sinf((1.0f - s) * th) / sn, b = sinf(s * th) / sn;
+                  for (i = 0; i < 4; ++i) cur[i] = cur[i] * a + t[i] * b;
+              }
+              {
+                  float n = sqrtf(cur[0]*cur[0]+cur[1]*cur[1]+cur[2]*cur[2]+cur[3]*cur[3]);
+                  if (n > 0.0f) for (i = 0; i < 4; ++i) cur[i] /= n;
+              }
+          }
+
+          static void look_quat(float dx, float dy, float dz, float up_y, float *out) {
+              float fx = dx, fy = dy, fz = dz;
+              float fn = sqrtf(fx*fx + fy*fy + fz*fz);
+              float ux, uy, uz, rx, ry, rz, rn, vx, vy, vz;
+              float m00, m01, m02, m10, m11, m12, m20, m21, m22;
+              float tr, qw, qx, qy, qz, s;
+              if (fn <= 0) return;
+              fx /= fn; fy /= fn; fz /= fn;
+              ux = 0; uy = up_y; uz = (up_y == 1.0f) ? 0.0f : 1.0f;
+              rx = uy*fz - uz*fy; ry = uz*fx - ux*fz; rz = ux*fy - uy*fx;
+              rn = sqrtf(rx*rx + ry*ry + rz*rz);
+              if (rn < 1e-6f) {
+                  ux = 0; uy = 0; uz = 1;
+                  rx = uy*fz - uz*fy; ry = uz*fx - ux*fz; rz = ux*fy - uy*fx;
+                  rn = sqrtf(rx*rx + ry*ry + rz*rz);
+              }
+              rx /= rn; ry /= rn; rz /= rn;
+              vx = fy*rz - fz*ry; vy = fz*rx - fx*rz; vz = fx*ry - fy*rx;
+              m00 = rx; m01 = vx; m02 = fx;
+              m10 = ry; m11 = vy; m12 = fy;
+              m20 = rz; m21 = vz; m22 = fz;
+              tr = m00 + m11 + m22;
+              if (tr > 0.0f) {
+                  s = sqrtf(tr + 1.0f) * 2.0f;
+                  qw = 0.25f*s; qx = (m21-m12)/s; qy = (m02-m20)/s; qz = (m10-m01)/s;
+              } else if (m00 > m11 && m00 > m22) {
+                  s = sqrtf(1.0f+m00-m11-m22)*2.0f;
+                  qw = (m21-m12)/s; qx = 0.25f*s; qy = (m01+m10)/s; qz = (m02+m20)/s;
+              } else if (m11 > m22) {
+                  s = sqrtf(1.0f+m11-m00-m22)*2.0f;
+                  qw = (m02-m20)/s; qx = (m01+m10)/s; qy = 0.25f*s; qz = (m12+m21)/s;
+              } else {
+                  s = sqrtf(1.0f+m22-m00-m11)*2.0f;
+                  qw = (m10-m01)/s; qx = (m02+m20)/s; qy = (m12+m21)/s; qz = 0.25f*s;
+              }
+              out[0] = qx; out[1] = qy; out[2] = qz; out[3] = qw;
+          }
+
+          static int cmd_aim(pid_t pid, uint64_t cam, uint64_t me, uint64_t arr,
+                             int count, int stride, uint64_t posoff,
+                             float smooth, float fov, char mode, int flags) {
+              struct timespec ts;
+              uint64_t ticks = 0;
+              int last = -1, zup;
+              float lastd = -1;
+              signal(SIGPIPE, SIG_IGN);
+              setvbuf(stdout, NULL, _IOLBF, 0);
+              if (!open_target(pid)) return 1;
+              if (stride != 4 && stride != 8) stride = g_ptr;
+              if (count <= 0) count = 64;
+              if (smooth < 0) smooth = 0;
+              if (smooth > 1) smooth = 1;
+              ts.tv_sec = 0; ts.tv_nsec = 8 * 1000 * 1000;
+              zup = (flags & 8) != 0;
+              printf("aim start pid=%d cam=0x%llx me=0x%llx arr=0x%llx count=%d stride=%d "
+                     "posoff=0x%llx smooth=%.2f fov=%.1f mode=%c flags=%d\n",
+                     pid, (unsigned long long)cam, (unsigned long long)me,
+                     (unsigned long long)arr, count, stride, (unsigned long long)posoff,
+                     smooth, fov, mode, flags);
+              for (;;) {
+                  float mx = 0, my = 0, mz = 0;
+                  int best = -1, i;
+                  float bestd = 1e18f, bx = 0, by = 0, bz = 0;
+                  ++ticks;
+                  if (me) read_vec3(me + posoff, &mx, &my, &mz);
+                  for (i = 0; i < count; ++i) {
+                      uint64_t e = 0;
+                      float ex, ey, ez, dx, dy, dz, d;
+                      if (arr) {
+                          if (!read_ptr(arr + (uint64_t)i * (uint64_t)stride, &e) || !e) continue;
+                      } else {
+                          if (i == 0) { e = me; if (!e) continue; } else continue;
+                      }
+                      if (!read_vec3(e + posoff, &ex, &ey, &ez)) continue;
+                      dx = ex - mx; dy = ey - my; dz = ez - mz;
+                      d = sqrtf(dx*dx + dy*dy + dz*dz);
+                      if (d < 0.15f) continue;
+                      if (fov > 0.0f && d > fov) continue;
+                      if (d < bestd) { bestd = d; best = i; bx = ex; by = ey; bz = ez; }
+                  }
+                  if (best >= 0) {
+                      float dx = bx - mx, dy = by - my, dz = bz - mz;
+                      if (mode == 'q') {
+                          float cur[4];
+                          if (mem_read(cam, cur, 16) == 16) {
+                              float tgt[4];
+                              look_quat(dx, dy, dz, zup ? 0.0f : 1.0f, tgt);
+                              if (flags & 4) tgt[1] = -tgt[1];
+                              slerp_quat(cur, tgt, smooth >= 0.99f ? 1.0f : smooth);
+                              mem_write(cam, cur, 16);
+                          }
+                      } else {
+                          double yaw, pitch, k;
+                          float cur[2];
+                          if (zup) {
+                              yaw = atan2(dy, dx) * RAD2DEG;
+                              pitch = -atan2(dz, sqrt(dx*dx + dy*dy)) * RAD2DEG;
+                          } else {
+                              yaw = atan2(dx, dz) * RAD2DEG;
+                              pitch = -asin(dy / sqrtf(dx*dx + dy*dy + dz*dz)) * RAD2DEG;
+                          }
+                          if (mem_read(cam, cur, 8) == 8) {
+                              double ny, np;
+                              int do_write = 1;
+                              k = (smooth >= 0.99f) ? 1.0 : smooth;
+                              ny = cur[0] + norm_deg(yaw - cur[0]) * k;
+                              np = cur[1] + norm_deg(pitch - cur[1]) * k;
+                              if (flags & 4) np = -np;
+                              if (flags & 1) do_write = fabs(norm_deg(yaw - cur[0])) > 1.0;
+                              if (do_write) {
+                                  float o2[2];
+                                  o2[0] = (float)ny; o2[1] = (float)np;
+                                  if (!(flags & 2)) o2[1] = cur[1];
+                                  mem_write(cam, o2, 8);
+                              }
+                          }
+                      }
+                      last = best; lastd = bestd;
+                  }
+                  if ((ticks % 125) == 0)
+                      printf("t=%llu target=%d dist=%.1f mode=%c\n",
+                             (unsigned long long)ticks, last, lastd, mode);
+                  nanosleep(&ts, NULL);
+              }
+              return 0;
+          }
+
+          int main(int argc, char **argv) {
+              const char *c;
+              pid_t pid;
+              if (argc < 2) return cmd_help();
+              c = argv[1];
+              if (!strcmp(c, "help") || !strcmp(c, "-h") || !strcmp(c, "--help")) return cmd_help();
+              if (!strcmp(c, "version")) { printf("vnxmem %s\n", VERSION); return 0; }
+              if (!strcmp(c, "freset")) { g_fn = 0; g_fsnapn = 0; printf("cleared\n"); return 0; }
+              if (argc < 3) { fprintf(stderr, "! need pid\n"); return 1; }
+              pid = (pid_t)strtol(argv[2], NULL, 10);
+              if (pid <= 0) { fprintf(stderr, "! bad pid\n"); return 1; }
+
+              if (!strcmp(c, "probe"))     return cmd_probe(pid);
+              if (!strcmp(c, "tracerpid")) return cmd_tracerpid(pid);
+              if (!strcmp(c, "mods"))      return cmd_mods(pid);
+              if (!strcmp(c, "attach"))    { printf("no attach needed\n"); return 0; }
+              if (!strcmp(c, "detach"))    { printf("detached\n"); return 0; }
+              if (!strcmp(c, "read")) {
+                  if (argc < 5) die("read needs addr len");
+                  return cmd_read(pid, strtoull(argv[3], NULL, 0), (size_t)strtoull(argv[4], NULL, 0));
+              }
+              if (!strcmp(c, "write")) {
+                  if (argc < 5) die("write needs addr hex");
+                  return cmd_write(pid, strtoull(argv[3], NULL, 0), argv[4]);
+              }
+              if (!strcmp(c, "findm")) {
+                  if (argc < 6) die("findm needs module type pattern");
+                  return cmd_findm(pid, argv[3], argv[4], argv[5]);
+              }
+              if (!strcmp(c, "fnew")) {
+                  if (argc < 6) die("fnew needs module type value");
+                  return cmd_fnew(pid, argv[3], argv[4][0], argv[5]);
+              }
+              if (!strcmp(c, "fnext")) {
+                  if (argc < 5) die("fnext needs type value");
+                  return cmd_fnext(pid, argv[3][0], argv[4]);
+              }
+              if (!strcmp(c, "frange")) {
+                  if (argc < 6) die("frange needs type lo hi");
+                  return cmd_frange(pid, argv[3][0], argv[4], argv[5]);
+              }
+              if (!strcmp(c, "fshow")) return cmd_fshow(pid, argc >= 4 ? (size_t)strtoul(argv[3], NULL, 10) : 32);
+              if (!strcmp(c, "fset")) {
+                  if (argc < 6) die("fset needs index type value");
+                  return cmd_fset(pid, (size_t)strtoul(argv[3], NULL, 10), argv[4][0], argv[5]);
+              }
+              if (!strcmp(c, "fsnap"))    return cmd_fsnap(pid);
+              if (!strcmp(c, "frestore")) return cmd_frestore(pid);
+              if (!strcmp(c, "aim")) {
+                  if (argc < 12) die("aim needs 9 args");
+                  return cmd_aim(pid,
+                      strtoull(argv[3], NULL, 0), strtoull(argv[4], NULL, 0),
+                      strtoull(argv[5], NULL, 0), atoi(argv[6]), atoi(argv[7]),
+                      strtoull(argv[8], NULL, 0), strtof(argv[9], NULL),
+                      strtof(argv[10], NULL), argv[11][0],
+                      argc >= 13 ? atoi(argv[12]) : 0);
+              }
+              fprintf(stderr, "! unknown command '%s'\n", c);
+              cmd_help();
+              return 1;
+          }
+          VNXC
+
+          echo "--- files written ---"
+          for f in settings.gradle.kts build.gradle.kts app/build.gradle.kts \
+                   app/src/main/AndroidManifest.xml app/src/main/cpp/vnxmem.c \
+                   app/src/main/java/ai/venice/vnx/MainActivity.kt; do
+            if [ -s "$f" ]; then echo "OK   $f ($(wc -c <"$f") bytes)"; else echo "MISS $f"; exit 1; fi
+          done
+
+      - name: build
         run: |
-          NDK="$ANDROID_HOME/ndk/26.1.10909125"
-          OUT=app/src/main/assets
-          mkdir -p "$OUT"
-          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" -O2 -static -o "$OUT/vnxmem-arm64-v8a" app/src/main/cpp/vnxmem.c
-          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi24-clang" -O2 -static -o "$OUT/vnxmem-armeabi-v7a" app/src/main/cpp/vnxmem.c
-          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android24-clang" -O2 -static -o "$OUT/vnxmem-x86_64" app/src/main/cpp/vnxmem.c
-          ls -la "$OUT"
+          set -euo pipefail
+          echo "--- host C check ---"
+          gcc -O2 -Wall -o /tmp/vnxmem_host app/src/main/cpp/vnxmem.c -lm
+          /tmp/vnxmem_host help
 
-      - name: Build APK
-        run: gradle assembleDebug assembleRelease --no-daemon --stacktrace
+          echo "--- native 4 abi ---"
+          NDKROOT=""
+          for d in "$ANDROID_HOME"/ndk/*; do
+            if [ -x "$d/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" ]; then NDKROOT="$d"; fi
+          done
+          [ -n "$NDKROOT" ] || NDKROOT="$ANDROID_HOME/ndk/${NDK_VERSION}"
+          TC="$NDKROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          [ -x "$TC/clang" ] || { echo "::error::no clang at $TC"; ls "$ANDROID_HOME/ndk"; exit 1; }
+          [ -x "$TC/llvm-strip" ] || { echo "::error::no llvm-strip"; exit 1; }
 
-      - name: Upload APK
+          bld() {
+            "$TC/${2}24-clang" -O2 -static -fPIE -pie -ffunction-sections \
+              -fdata-sections -Wl,--gc-sections -Wall \
+              -o "app/src/main/assets/vnxmem-$1" app/src/main/cpp/vnxmem.c -lm
+            "$TC/llvm-strip" "app/src/main/assets/vnxmem-$1"
+            echo "built $1 -> $(stat -c%s "app/src/main/assets/vnxmem-$1") bytes"
+          }
+          bld arm64-v8a   aarch64-linux-android
+          bld armeabi-v7a armv7a-linux-androideabi
+          bld x86_64      x86_64-linux-android
+          bld x86         i686-linux-android
+          for a in arm64-v8a armeabi-v7a x86_64 x86; do
+            test -s "app/src/main/assets/vnxmem-$a" || { echo "::error::missing $a"; exit 1; }
+          done
+
+          echo "--- gradle ---"
+          gradle --no-daemon --console=plain assembleDebug assembleRelease
+
+          mkdir -p out
+          cp app/build/outputs/apk/release/*.apk "out/$APK_NAME"
+          cp app/build/outputs/apk/debug/*.apk   "out/VNX-Apex-debug.apk"
+          ls -la out/
+
+      - name: logs-on-fail
+        if: failure()
+        run: |
+          echo "=== last 60 lines of gradle ==="
+          tail -n 60 app/build/reports 2>/dev/null || true
+
+      - name: upload-apk
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: vnx-apk
-          path: |
-            app/build/outputs/apk/debug/*.apk
-            app/build/outputs/apk/release/*.apk
+          name: vnx-apex-apk
+          path: out/*.apk
           if-no-files-found: warn
+
+      - name: release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.8.${{ github.run_number }}
+          name: VNX Apex v1.8.${{ github.run_number }}
+          files: out/*.apk
+          fail_on_unmatched_files: true
